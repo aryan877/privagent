@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+# Environment variables (SECRETS!)
+.env
+.env.local
+.env.production
+
+# Agent data files (persistent storage)
+agent*_data.json
+
+# Sensitive JSON files (but allow important ones)
+keypair.json
+wallet.json
+private_keys.json
+secrets.json
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# uv
+.uv_cache/
