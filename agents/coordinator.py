@@ -8,7 +8,7 @@ from datetime import datetime
 from uuid import uuid4
 from dotenv import load_dotenv
 
-from uagents import Agent, Context, Model, Protocol
+from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatMessage,
     ChatAcknowledgement,
@@ -24,8 +24,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from models.messages import (
     PrivacyRequest, PrivacyResponse,
-    ExecutionRequest, ExecutionResponse,
-    MonitoringRequest, MonitoringResponse,
+    ExecutionResponse,
     PrivacyAlert
 )
 

@@ -11,7 +11,6 @@ from solana.rpc.async_api import AsyncClient
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 # RPCResponse is not used and not available in modern solana-py
-import asyncio
 import subprocess
 import json
 

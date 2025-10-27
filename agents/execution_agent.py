@@ -2,7 +2,6 @@
 Execution Agent - Handles transaction execution, DEX swaps, and MEV protection
 """
 import os
-import asyncio
 from typing import Optional, Dict
 from datetime import datetime
 from dotenv import load_dotenv
@@ -132,8 +131,8 @@ async def compressed_transfer(ctx: Context, req: TransferRequest) -> Dict:
         if not payer_keypair:
             return {"success": False, "error": "PAYER_PRIVATE_KEY not configured"}
 
-        # Light Protocol Program ID (mainnet)
-        LIGHT_COMPRESSION_PROGRAM = "SysCEgi7qEK4hAFjzeLCxpoSJaMFVKYnf8F2YZJews"
+        # Light Protocol Program IDs (mainnet) - for reference
+        # LIGHT_COMPRESSION_PROGRAM = "SysCEgi7qEK4hAFjzeLCxpoSJaMFVKYnf8F2YZJews"
 
         # Try Light Protocol CLI first
         try:
