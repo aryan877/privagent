@@ -33,9 +33,9 @@ echo ""
 # Function to run agent in background
 run_agent() {
     local agent_name=$1
-    local agent_file=$2
+    local agent_module=$2
     echo "  📡 Starting $agent_name..."
-    uv run python "$agent_file" &
+    uv run python -m "$agent_module" &
     pids+=($!)
 }
 
@@ -43,16 +43,16 @@ run_agent() {
 pids=()
 
 # Start all agents
-run_agent "Privacy Agent" "agents/privacy_agent.py"
+run_agent "Privacy Agent" "agents.privacy_agent"
 sleep 2
 
-run_agent "Execution Agent" "agents/execution_agent.py"
+run_agent "Execution Agent" "agents.execution_agent"
 sleep 2
 
-run_agent "Monitoring Agent" "agents/monitoring_agent.py"
+run_agent "Monitoring Agent" "agents.monitoring_agent"
 sleep 2
 
-run_agent "Coordinator Agent" "agents/coordinator.py"
+run_agent "Coordinator Agent" "agents.coordinator"
 sleep 2
 
 echo ""

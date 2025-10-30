@@ -1,741 +1,1022 @@
-"""
-Coordinator Agent - Main hub for user interaction via ASI:One Chat Protocol
-Routes requests to specialized agents and aggregates responses
-"""
+from __future__ import annotations
+
+import inspect
+import json
 import os
 import re
+import textwrap
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Awaitable, Callable, Dict, Optional
 from uuid import uuid4
+
+import httpx
 from dotenv import load_dotenv
 
-from uagents import Agent, Context, Protocol
-from uagents_core.contrib.protocols.chat import (
-    ChatMessage,
-    ChatAcknowledgement,
-    TextContent,
-    StartSessionContent,
-    EndSessionContent,
-    chat_protocol_spec
-)
-
-# Import Message Models
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from models.messages import (
-    PrivacyRequest, PrivacyResponse,
-    ExecutionResponse,
-    PrivacyAlert
-)
-
-# Load environment variables
+# Load .env file BEFORE importing config to ensure environment variables are available
 load_dotenv()
 
-# Agent configuration
+from openai import OpenAI
+from uagents import Agent, Context, Protocol
+from uagents_core.contrib.protocols.chat import (
+    ChatAcknowledgement,
+    ChatMessage,
+    EndSessionContent,
+    StartSessionContent,
+    TextContent,
+    chat_protocol_spec,
+)
+
+from agents.config import config
+# Import authentication module for agent-to-agent verification
+from agents.auth import auth_manager, create_message_digest
+from models.messages import (
+    ExecutionResponse,
+    MonitoringRequest,
+    MonitoringResponse,
+    PrivacyAlert,
+    PrivacyRequest,
+    PrivacyResponse,
+    SwapRequest,
+    TransferRequest,
+)
+
+# Regex patterns for extracting data from natural language
+ADDRESS_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")  # Solana base58 address format
+AMOUNT_PATTERN = re.compile(r"(\d+(?:\.\d+)?)")  # Decimal numbers (e.g., "5.5 USDC")
+
+
+@dataclass
+class RoutingDecision:
+    """
+    LLM-generated routing decision for a user query.
+
+    The coordinator uses an LLM to:
+    1. Understand user intent (e.g., "compress tokens" → privacy agent)
+    2. Extract parameters (wallet address, amounts, token symbols)
+    3. Route to the correct specialized agent (privacy/execution/monitoring)
+    4. Handle multi-step workflows (e.g., compress then transfer)
+
+    Example:
+    User: "Compress 100 USDC for wallet ABC123..."
+    → intent="compress", parameters={wallet="ABC123", amount=100, token="USDC"}
+    → Route to privacy agent
+    """
+    intent: str  # "transfer", "swap", "compress", "monitor", "report"
+    confidence: float  # LLM's confidence 0.0-1.0
+    parameters: Dict[str, Any]  # Extracted params (wallet, amount, tokens, etc.)
+    missing: list[str]  # Required params that couldn't be extracted
+    reasoning: str  # LLM's explanation for debugging
+    raw: str  # Raw LLM response for audit trail
+
+
+class CoordinatorService:
+    """
+    Central orchestration service - the "brain" of the agent system.
+
+    Responsibilities:
+    1. Natural Language Understanding (NLU) - Parse user queries using LLM
+    2. Intent Routing - Determine which agent should handle the request
+    3. Parameter Extraction - Pull wallet addresses, amounts, tokens from text
+    4. Agent Discovery - Find agents on the network (static or dynamic)
+    5. Session Management - Track conversations and pending operations
+    6. Response Aggregation - Collect results from multiple agents
+
+    Architecture:
+    - Uses OpenAI-compatible LLM for intent classification
+    - Communicates with specialized agents via uAgents messaging
+    - Maintains session state for multi-turn conversations
+    - Supports both static (env vars) and dynamic (almanac) agent discovery
+
+    Security: Agent-to-agent messages cryptographically verified (see agents/auth.py)
+
+    Example Flow:
+    User: "I want to privately swap 50 USDC to SOL"
+    1. LLM extracts: intent=swap, amount=50, input=USDC, output=SOL, privacy=true
+    2. Coordinator routes to execution agent (handles swaps)
+    3. Execution agent enables MEV protection (privacy flag)
+    4. Result returned to user via coordinator
+    """
+
+    def __init__(self) -> None:
+        # Agent addresses - can be hardcoded (env vars) or discovered dynamically
+        self.privacy_agent = os.getenv("PRIVACY_AGENT_ADDRESS", "")
+        self.execution_agent = os.getenv("EXECUTION_AGENT_ADDRESS", "")
+        self.monitoring_agent = os.getenv("MONITORING_AGENT_ADDRESS", "")
+        self.config = config
+
+        # LLM setup for natural language understanding
+        api_key = self.config.llm.api_key
+        if not api_key:
+            raise ValueError("LLM API key is required for coordinator intent routing.")
+
+        base_url = self.config.llm.base_url
+        if self.config.llm.provider == "asi1" and not base_url:
+            base_url = self.config.llm.asi1_base_url
+
+        # Maintain a single OpenAI client so HTTP sessions and rate limits are shared across requests
+        self.llm_client = OpenAI(api_key=api_key, base_url=base_url)
+
+        # LLM parameters
+        self._llm_model = (
+            self.config.llm.asi1_model
+            if self.config.llm.provider == "asi1"
+            else self.config.llm.model
+        )
+        self._llm_temperature = self.config.llm.temperature  # Lower = more deterministic
+        self._llm_max_tokens = self.config.llm.max_tokens  # Response length limit
+        self._llm_timeout = self.config.llm.timeout_seconds  # Prevent hanging
+
+        # Dynamic agent discovery cache (reduces network queries to almanac)
+        self._discovery_cache = {}
+        self._cache_ttl = 300  # Cache discovered agents for 5 minutes
+
+    async def startup(self, ctx: Context) -> None:
+        ctx.storage.set("sessions", {})
+        ctx.storage.set("pending", {})
+        ctx.storage.set("alerts", [])
+
+        # Log discovery mode
+        if self.privacy_agent and self.execution_agent and self.monitoring_agent:
+            ctx.logger.info("coordinator ready - using hardcoded agent addresses")
+        else:
+            ctx.logger.info("coordinator ready - will use dynamic discovery for missing agents")
+            await self._discover_agents(ctx)
+
+    async def handle_chat_message(self, ctx: Context, sender: str, message: ChatMessage) -> None:
+        await self._acknowledge(ctx, sender, message)
+
+        for item in message.content:
+            if isinstance(item, StartSessionContent):
+                await self._open_session(ctx, message.msg_id, sender)
+                await self._send_text(ctx, sender, self._welcome_message())
+            elif isinstance(item, TextContent):
+                reply = await self._route_text(ctx, sender, item.text)
+                await self._send_text(ctx, sender, reply)
+            elif isinstance(item, EndSessionContent):
+                await self._close_session(ctx, message.msg_id)
+                await self._send_text(ctx, sender, "Session closed. Reach out anytime.")
+
+    async def receive_privacy_response(self, ctx: Context, sender: str, msg: PrivacyResponse) -> None:
+        # Verify message from privacy agent (agent-to-agent auth)
+        if self.privacy_agent and sender != self.privacy_agent:
+            ctx.logger.warning(f"Privacy response from unauthorized agent: {sender}")
+            return
+
+        pending = self._pending(ctx).get(msg.request_id)
+        if not pending:
+            ctx.logger.warning("untracked privacy response %s", msg.request_id)
+            return
+
+        text = self._format_privacy_response(msg)
+        await self._send_text(ctx, pending["sender"], text)
+        self._remove_pending(ctx, msg.request_id)
+
+    async def receive_execution_response(self, ctx: Context, sender: str, msg: ExecutionResponse) -> None:
+        # Verify message from execution agent
+        if self.execution_agent and sender != self.execution_agent:
+            ctx.logger.warning(f"Execution response from unauthorized agent: {sender}")
+            return
+
+        pending = self._pending(ctx).get(msg.request_id)
+        if not pending:
+            ctx.logger.warning("untracked execution response %s", msg.request_id)
+            return
+
+        text = self._format_execution_response(msg)
+        await self._send_text(ctx, pending["sender"], text)
+        self._remove_pending(ctx, msg.request_id)
+
+    async def receive_monitoring_response(self, ctx: Context, sender: str, msg: MonitoringResponse) -> None:
+        # Verify message from monitoring agent
+        if self.monitoring_agent and sender != self.monitoring_agent:
+            ctx.logger.warning(f"Monitoring response from unauthorized agent: {sender}")
+            return
+
+        pending = self._pending(ctx).get(msg.request_id)
+        if not pending:
+            ctx.logger.warning("untracked monitoring response %s", msg.request_id)
+            return
+
+        text = self._format_monitoring_response(msg.result)
+        await self._send_text(ctx, pending["sender"], text)
+        self._remove_pending(ctx, msg.request_id)
+
+    async def receive_privacy_alert(self, ctx: Context, sender: str, msg: PrivacyAlert) -> None:
+        # Verify alert from monitoring/privacy agents
+        if self.monitoring_agent and sender not in [self.monitoring_agent, self.privacy_agent]:
+            ctx.logger.warning(f"Privacy alert from unauthorized agent: {sender}")
+            return
+
+        alerts = ctx.storage.get("alerts", [])
+        alerts.append(msg.dict())
+        ctx.storage.set("alerts", alerts)
+        ctx.logger.info(
+            "privacy alert %s for wallet %s (%s)",
+            msg.alert_type,
+            msg.wallet_address,
+            msg.severity,
+        )
+
+    async def _acknowledge(self, ctx: Context, sender: str, message: ChatMessage) -> None:
+        acknowledgement = ChatAcknowledgement(
+            timestamp=datetime.utcnow(),
+            acknowledged_msg_id=message.msg_id,
+        )
+        await ctx.send(sender, acknowledgement)
+
+    async def _open_session(self, ctx: Context, session_id: str, sender: str) -> None:
+        sessions = ctx.storage.get("sessions", {})
+        sessions[str(session_id)] = {"sender": sender, "opened": datetime.utcnow().isoformat()}
+        ctx.storage.set("sessions", sessions)
+
+    async def _close_session(self, ctx: Context, session_id: str) -> None:
+        sessions = ctx.storage.get("sessions", {})
+        sessions.pop(str(session_id), None)
+        ctx.storage.set("sessions", sessions)
+
+    async def _route_text(self, ctx: Context, sender: str, text: str) -> str:
+        trimmed = text.strip()
+        if not trimmed:
+            return "I did not catch that. Try describing the action you want me to take."
+
+        try:
+            # The router returns both the intent label and any structured parameters we need.
+            decision = self._call_router(trimmed)
+        except ValueError as exc:
+            ctx.logger.error("intent routing parse error: %s", exc)
+            return (
+                "I had trouble understanding your request. "
+                "Please rephrase or ask for `help` to see examples."
+            )
+        except Exception as exc:
+            ctx.logger.error("intent routing failed: %s", exc)
+            return (
+                "I encountered an error while processing your request. "
+                "Please try again shortly."
+            )
+
+        ctx.logger.info(
+            "intent=%s confidence=%.2f sender=%s missing=%s reason=%s",
+            decision.intent,
+            decision.confidence,
+            sender,
+            decision.missing,
+            decision.reasoning,
+        )
+
+        if decision.missing:
+            missing = ", ".join(decision.missing)
+            return (
+                f"I still need the following details before I can continue: {missing}. "
+                "Please provide them so I can help."
+            )
+
+        async def _sync_response(value: str) -> str:
+            return value
+
+        # Each supported intent maps to a coroutine that knows how to talk to the downstream agent.
+        handler_map: Dict[str, Callable[[], Awaitable[str]]] = {
+            "help": lambda: _sync_response(self._help_message()),
+            "greeting": lambda: _sync_response(self._welcome_message()),
+            "compression": lambda: self._handle_compression_llm(ctx, sender, decision.parameters),
+            "transfer": lambda: self._handle_transfer_llm(ctx, sender, decision.parameters),
+            "swap": lambda: self._handle_swap_llm(ctx, sender, decision.parameters),
+            "privacy_report": lambda: self._handle_privacy_report_llm(ctx, sender, decision.parameters),
+            "monitoring": lambda: self._handle_monitoring_llm(ctx, sender, decision.parameters),
+        }
+
+        handler = handler_map.get(decision.intent)
+        if not handler:
+            return (
+                "I'm not sure how to handle that request. "
+                "Ask for `help` to see available commands."
+            )
+
+        result = handler()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def _call_router(self, text: str) -> RoutingDecision:
+        # We ask the LLM to emit compact JSON so that parsing failures are explicit.
+        response = self.llm_client.chat.completions.create(
+            model=self._llm_model,
+            temperature=self._llm_temperature,
+            max_tokens=self._llm_max_tokens,
+            timeout=self._llm_timeout,
+            messages=[
+                {"role": "system", "content": self._get_routing_system_prompt()},
+                {"role": "user", "content": text},
+            ],
+        )
+
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError) as exc:
+            raise ValueError("LLM response missing content") from exc
+
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM response was not valid JSON") from exc
+
+        if not isinstance(payload, dict):
+            raise ValueError("LLM routing payload must be a JSON object")
+
+        intent = str(payload.get("intent") or "unknown")
+        confidence_raw = payload.get("confidence")
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        parameters = payload.get("parameters") or {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+
+        missing_raw = payload.get("missing") or []
+        if isinstance(missing_raw, list):
+            missing = [str(item) for item in missing_raw]
+        else:
+            missing = []
+
+        reasoning = str(payload.get("reasoning") or "")
+
+        return RoutingDecision(
+            intent=intent,
+            confidence=confidence,
+            parameters=parameters,
+            missing=missing,
+            reasoning=reasoning,
+            raw=content,
+        )
+
+    def _get_routing_system_prompt(self) -> str:
+        return textwrap.dedent(
+            """
+            You route user requests for a privacy-focused Solana agent system.
+            Return compact JSON only in this exact shape:
+            {
+              "intent": "<intent>",
+              "confidence": <float 0-1>,
+              "parameters": {...},
+              "missing": ["param", ...],
+              "reasoning": "short justification"
+            }
+
+            Intents: greeting, help, compression, transfer, swap, privacy_report, monitoring, unknown.
+            Required parameters:
+              compression -> wallet_address, amount
+              transfer -> from_wallet, to_wallet, amount, token (USDC|USDT|SOL)
+              swap -> wallet, amount, input_token, output_token (USDC|USDT|SOL)
+              privacy_report -> wallet_address
+              monitoring -> wallet_address, optional threshold (0-100)
+
+            Extract Solana wallet addresses (base58, 32-44 chars).
+            Parse numeric amounts as floats.
+            Leave missing parameters in the list.
+            Keep reasoning brief and factual.
+            Never add markdown or extra keys.
+            """
+        ).strip()
+
+    async def _handle_compression_llm(self, ctx: Context, sender: str, params: Dict[str, Any]) -> str:
+        privacy_agent = await self._get_agent_address(ctx, "privacy")
+        if not privacy_agent:
+            return "❌ Privacy agent not available. Please ensure privacy agents are running and registered on Agentverse."
+
+        wallet_address = params.get("wallet_address")
+        amount = params.get("amount", self.config.token.default_compression_amount)
+
+        if not wallet_address:
+            return "Wallet address is required for compression requests."
+
+        try:
+            amount_value = float(amount)
+        except (TypeError, ValueError):
+            return "Amount must be numeric for compression requests."
+
+        request_id = str(uuid4())
+        request = PrivacyRequest(
+            action="compress",
+            wallet_address=wallet_address,
+            amount=amount_value,
+            request_id=request_id,
+        )
+        await ctx.send(privacy_agent, request)
+        self._store_pending(ctx, request_id, sender, "privacy")
+
+        return (
+            f"Compression request submitted for {amount_value} tokens in wallet {wallet_address[:8]}... "
+            "I will update you when the privacy agent finishes processing."
+        )
+
+    async def _handle_transfer_llm(self, ctx: Context, sender: str, params: Dict[str, Any]) -> str:
+        execution_agent = await self._get_agent_address(ctx, "execution")
+        if not execution_agent:
+            return "❌ Execution agent not available. Please ensure execution agents are running and registered on Agentverse."
+
+        from_wallet = params.get("from_wallet")
+        to_wallet = params.get("to_wallet")
+        amount = params.get("amount")
+        token = params.get("token", "USDC")
+
+        if not from_wallet or not to_wallet or amount is None:
+            return "Transfer requests require from_wallet, to_wallet, and amount parameters."
+
+        try:
+            amount_value = float(amount)
+        except (TypeError, ValueError):
+            return "Amount must be numeric for transfer requests."
+
+        token_mint = self._token_symbol_to_mint(str(token))
+        if not token_mint:
+            return f"Unknown token: {token}. Please use USDC, USDT, or SOL."
+
+        request_id = str(uuid4())
+        transfer = TransferRequest(
+            from_wallet=from_wallet,
+            to_wallet=to_wallet,
+            amount=amount_value,
+            token_mint=token_mint,
+            use_compression=bool(params.get("use_compression", False)),
+            request_id=request_id,
+        )
+        await ctx.send(execution_agent, transfer)
+        self._store_pending(ctx, request_id, sender, "transfer")
+
+        return (
+            f"Transfer of {amount_value} {token} from {from_wallet[:8]}... to {to_wallet[:8]}... submitted. "
+            "I will relay the transaction status once it is available."
+        )
+
+    async def _handle_swap_llm(self, ctx: Context, sender: str, params: Dict[str, Any]) -> str:
+        execution_agent = await self._get_agent_address(ctx, "execution")
+        if not execution_agent:
+            return "❌ Execution agent not available. Please ensure execution agents are running and registered on Agentverse."
+
+        wallet = params.get("wallet")
+        amount = params.get("amount")
+        input_token = params.get("input_token")
+        output_token = params.get("output_token")
+
+        if not wallet or amount is None or not input_token or not output_token:
+            return "Swap requests require wallet, amount, input_token, and output_token parameters."
+
+        try:
+            amount_value = float(amount)
+        except (TypeError, ValueError):
+            return "Amount must be numeric for swap requests."
+
+        input_mint = self._token_symbol_to_mint(str(input_token))
+        output_mint = self._token_symbol_to_mint(str(output_token))
+
+        if not input_mint or not output_mint:
+            return "Invalid tokens. Please specify USDC, USDT, or SOL for both input and output."
+
+        request_id = str(uuid4())
+        swap_request = SwapRequest(
+            wallet=wallet,
+            input_token=input_mint,
+            output_token=output_mint,
+            amount=amount_value,
+            request_id=request_id,
+        )
+        await ctx.send(execution_agent, swap_request)
+        self._store_pending(ctx, request_id, sender, "swap")
+
+        return (
+            f"Swap request sent: {amount_value} {input_token} → {output_token} for wallet {wallet[:8]}... "
+            "The execution agent will handle quoting and execution. I'll report back with the outcome."
+        )
+
+    async def _handle_privacy_report_llm(self, ctx: Context, sender: str, params: Dict[str, Any]) -> str:
+        privacy_agent = await self._get_agent_address(ctx, "privacy")
+        if not privacy_agent:
+            return "❌ Privacy agent not available. Please ensure privacy agents are running and registered on Agentverse."
+
+        wallet_address = params.get("wallet_address")
+        if not wallet_address:
+            return "Wallet address is required for privacy reports."
+
+        request_id = str(uuid4())
+        request = PrivacyRequest(
+            action="report",
+            wallet_address=wallet_address,
+            request_id=request_id,
+        )
+        await ctx.send(privacy_agent, request)
+        self._store_pending(ctx, request_id, sender, "privacy")
+
+        return (
+            f"Privacy report request submitted for wallet {wallet_address[:8]}... "
+            "I will provide the analysis once complete."
+        )
+
+    async def _handle_monitoring_llm(self, ctx: Context, sender: str, params: Dict[str, Any]) -> str:
+        monitoring_agent = await self._get_agent_address(ctx, "monitoring")
+        if not monitoring_agent:
+            return "❌ Monitoring agent not available. Please ensure monitoring agents are running and registered on Agentverse."
+
+        wallet_address = params.get("wallet_address")
+        threshold = params.get("threshold", self.config.monitoring.default_privacy_threshold)
+
+        if not wallet_address:
+            return "Wallet address is required for monitoring requests."
+
+        try:
+            threshold_value = int(threshold)
+        except (TypeError, ValueError):
+            return "Threshold must be an integer between 0 and 100."
+
+        threshold_value = max(0, min(100, threshold_value))
+
+        request_id = str(uuid4())
+        request = MonitoringRequest(
+            action="monitor",
+            wallet_address=wallet_address,
+            threshold=threshold_value,
+            request_id=request_id,
+        )
+        await ctx.send(monitoring_agent, request)
+        self._store_pending(ctx, request_id, sender, "monitoring")
+
+        return (
+            f"Monitoring request submitted for wallet {wallet_address[:8]}... with threshold {threshold_value}. "
+            "I will alert you of any suspicious activity."
+        )
+
+    def _token_symbol_to_mint(self, symbol: str) -> Optional[str]:
+        """Convert token symbol (USDC/USDT/SOL) to mint address."""
+        symbol_upper = symbol.upper()
+        if symbol_upper == "USDC":
+            return self.config.token.usdc_mint
+        elif symbol_upper == "USDT":
+            return self.config.token.usdt_mint
+        elif symbol_upper == "SOL":
+            return self.config.token.sol_mint
+        return None
+
+    # =========================================================================
+    # Command Handlers
+    # =========================================================================
+
+    async def _handle_compression(self, ctx: Context, sender: str, text: str) -> str:
+        privacy_agent = await self._get_agent_address(ctx, "privacy")
+        if not privacy_agent:
+            return "❌ Privacy agent not available. Please ensure privacy agents are running and registered on Agentverse."
+
+        wallet = self._extract_addresses(text, limit=1)
+        amount = self._extract_amount(text)
+        if not wallet:
+            return "Provide the wallet address you wish to compress. Example: `compress 500 USDC in wallet ...`."
+
+        request_id = str(uuid4())
+        request = PrivacyRequest(
+            action="compress",
+            wallet_address=wallet[0],
+            amount=amount or self.config.token.default_compression_amount,
+            request_id=request_id,
+        )
+        await ctx.send(privacy_agent, request)
+        self._store_pending(ctx, request_id, sender, "privacy")
+
+        return (
+            "Compression request submitted. "
+            "I will update you when the privacy agent finishes processing."
+        )
+
+    async def _handle_transfer(self, ctx: Context, sender: str, text: str) -> str:
+        execution_agent = await self._get_agent_address(ctx, "execution")
+        if not execution_agent:
+            return "❌ Execution agent not available. Please ensure execution agents are running and registered on Agentverse."
+
+        addresses = self._extract_addresses(text, limit=2)
+        if len(addresses) < 2:
+            return (
+                "Transfers require both a source and destination address. "
+                "Example: `transfer 25 usdc from <source> to <destination>`."
+            )
+
+        amount = self._extract_amount(text)
+        if amount is None:
+            return "Specify the amount you want to transfer. Example: `transfer 25 usdc ...`."
+
+        token_mint = self._token_from_text(text)
+        if token_mint is None:
+            return (
+                "I could not determine which token to use. "
+                "Mention `USDC`, `USDT`, or `SOL` in your request."
+            )
+
+        request_id = str(uuid4())
+        transfer = TransferRequest(
+            from_wallet=addresses[0],
+            to_wallet=addresses[1],
+            amount=amount,
+            token_mint=token_mint,
+            use_compression="compress" in text.lower(),
+            request_id=request_id,
+        )
+        await ctx.send(execution_agent, transfer)
+        self._store_pending(ctx, request_id, sender, "transfer")
+
+        return (
+            "Transfer submitted to the execution agent. "
+            "I will relay the transaction status once it is available."
+        )
+
+    async def _handle_swap(self, ctx: Context, sender: str, text: str) -> str:
+        execution_agent = await self._get_agent_address(ctx, "execution")
+        if not execution_agent:
+            return "❌ Execution agent not available. Please ensure execution agents are running and registered on Agentverse."
+
+        amount = self._extract_amount(text)
+        if amount is None:
+            return "Please include the amount to swap. Example: `swap 1 sol to usdc`."
+
+        tokens = self._extract_tokens_for_swap(text)
+        if tokens is None:
+            return "I could not determine the swap pair. Example: `swap 1 sol to usdc`."
+
+        if not tokens.wallet:
+            return "Include the wallet that should sign the swap. Example: `swap 1 sol to usdc for <wallet>`."
+
+        request_id = str(uuid4())
+        swap_request = SwapRequest(
+            wallet=tokens.wallet,
+            input_token=tokens.input_token,
+            output_token=tokens.output_token,
+            amount=amount,
+            request_id=request_id,
+        )
+        await ctx.send(execution_agent, swap_request)
+        self._store_pending(ctx, request_id, sender, "swap")
+
+        return (
+            "Swap request sent. The execution agent will handle quoting and execution. "
+            "I'll report back with the outcome."
+        )
+
+    async def _handle_privacy_report(self, ctx: Context, sender: str, text: str) -> str:
+        privacy_agent = await self._get_agent_address(ctx, "privacy")
+        if not privacy_agent:
+            return "❌ Privacy agent not available. Please ensure privacy agents are running and registered on Agentverse."
+
+        wallet = self._extract_addresses(text, limit=1)
+        if not wallet:
+            return "Provide the wallet address you want me to analyse. Example: `privacy report for <wallet>`."
+
+        request_id = str(uuid4())
+        request = PrivacyRequest(
+            action="report",
+            wallet_address=wallet[0],
+            request_id=request_id,
+        )
+        await ctx.send(privacy_agent, request)
+        self._store_pending(ctx, request_id, sender, "privacy")
+
+        return "Privacy evaluation started. I'll share the report once it is complete."
+
+    async def _handle_monitoring(self, ctx: Context, sender: str, text: str) -> str:
+        monitoring_agent = await self._get_agent_address(ctx, "monitoring")
+        if not monitoring_agent:
+            return "❌ Monitoring agent not available. Please ensure monitoring agents are running and registered on Agentverse."
+
+        wallet = self._extract_addresses(text, limit=1)
+        if not wallet:
+            return "Provide the wallet address to monitor. Example: `monitor wallet <address> for privacy issues`."
+
+        threshold = self._extract_threshold(text)
+
+        request_id = str(uuid4())
+        request = MonitoringRequest(
+            action="monitor",
+            wallet_address=wallet[0],
+            threshold=threshold,
+            request_id=request_id,
+        )
+        await ctx.send(monitoring_agent, request)
+        self._store_pending(ctx, request_id, sender, "monitoring")
+
+        return (
+            f"Monitoring request submitted. I'll alert you if the risk score crosses {threshold}."
+        )
+
+    async def _send_text(self, ctx: Context, recipient: str, text: str) -> None:
+        message = ChatMessage(
+            timestamp=datetime.utcnow(),
+            msg_id=uuid4(),
+            content=[TextContent(type="text", text=text)],
+        )
+        await ctx.send(recipient, message)
+
+    def _help_message(self) -> str:
+        return textwrap.dedent(
+            """
+            Supported requests:
+              • `compress 500 usdc in <wallet>` – compress a token account
+              • `transfer 25 usdc from <source> to <destination>` – send tokens
+              • `swap 1 sol to usdc for <wallet>` – quote and execute a swap
+              • `privacy report for <wallet>` – run a privacy review
+
+            Ask for `help` anytime to revisit these examples.
+            """
+        ).strip()
+
+    def _welcome_message(self) -> str:
+        return (
+            "Welcome. I coordinate between the privacy, execution, and monitoring agents. "
+            "Describe what you need or ask for `help` to see available commands."
+        )
+
+    def _store_pending(self, ctx: Context, request_id: str, sender: str, category: str) -> None:
+        pending = self._pending(ctx)
+        pending[request_id] = {"sender": sender, "category": category}
+        ctx.storage.set("pending", pending)
+
+    def _pending(self, ctx: Context) -> Dict[str, Dict[str, str]]:
+        return ctx.storage.get("pending", {})
+
+    def _remove_pending(self, ctx: Context, request_id: str) -> None:
+        pending = ctx.storage.get("pending", {})
+        pending.pop(request_id, None)
+        ctx.storage.set("pending", pending)
+
+    def _extract_addresses(self, text: str, *, limit: int) -> list[str]:
+        return ADDRESS_PATTERN.findall(text)[:limit]
+
+    def _extract_amount(self, text: str) -> Optional[float]:
+        match = AMOUNT_PATTERN.search(text.replace(",", ""))
+        if not match:
+            return None
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+
+    def _token_from_text(self, text: str) -> Optional[str]:
+        lowered = text.lower()
+        if "usdc" in lowered:
+            return self.config.token.usdc_mint
+        if "usdt" in lowered:
+            return self.config.token.usdt_mint
+        if "sol" in lowered:
+            return self.config.token.sol_mint
+        return None
+
+    def _extract_threshold(self, text: str) -> int:
+        match = re.search(r"(\d{2,3})\s*(?:score|risk|threshold)?", text)
+        if match:
+            try:
+                value = int(match.group(1))
+                return max(10, min(100, value))
+            except ValueError:
+                pass
+        return self.config.monitoring.default_privacy_threshold
+
+    @dataclass
+    class SwapTokens:
+        wallet: str
+        input_token: str
+        output_token: str
+
+    def _extract_tokens_for_swap(self, text: str) -> Optional["CoordinatorService.SwapTokens"]:
+        addresses = self._extract_addresses(text, limit=1)
+        wallet = addresses[0] if addresses else ""
+        lowered = text.lower()
+
+        if "sol" in lowered and "usdc" in lowered:
+            return self.SwapTokens(
+                wallet=wallet,
+                input_token=self.config.token.sol_mint,
+                output_token=self.config.token.usdc_mint,
+            )
+        if "usdc" in lowered and "sol" in lowered:
+            return self.SwapTokens(
+                wallet=wallet,
+                input_token=self.config.token.usdc_mint,
+                output_token=self.config.token.sol_mint,
+            )
+        if "usdt" in lowered and "usdc" in lowered:
+            return self.SwapTokens(
+                wallet=wallet,
+                input_token=self.config.token.usdt_mint,
+                output_token=self.config.token.usdc_mint,
+            )
+        return None
+
+    def _format_privacy_response(self, msg: PrivacyResponse) -> str:
+        if not msg.success:
+            return f"Privacy operation failed: {msg.result.get('error', 'unknown error')}."
+
+        result = msg.result
+        score = result.get("privacy_score")
+        if score is None:
+            score = result.get("score")
+        breakdown = result.get("breakdown", {})
+        lines = [
+            "Privacy report complete.",
+            f"Score: {score}/100" if score is not None else "Score unavailable.",
+        ]
+        if breakdown:
+            parts = ", ".join(f"{k}: {v}" for k, v in breakdown.items())
+            lines.append(f"Breakdown: {parts}")
+        recommendations = result.get("recommendations")
+        if recommendations:
+            lines.append("Recommendations:")
+            lines.extend(f"- {item}" for item in recommendations[:5])
+        return "\n".join(lines)
+
+    def _format_execution_response(self, msg: ExecutionResponse) -> str:
+        if not msg.success:
+            return f"Transaction failed: {msg.result.get('error', 'unknown error')}."
+
+        signature = msg.signature or msg.result.get("signature", "pending")
+        details = msg.result.get("details", {})
+        lines = [
+            "Transaction confirmed.",
+            f"Signature: {signature}",
+        ]
+        if msg.explorer_url:
+            lines.append(f"Explorer: {msg.explorer_url}")
+        if details:
+            lines.append("Details:")
+            lines.extend(f"- {key}: {value}" for key, value in details.items())
+        return "\n".join(lines)
+
+    def _format_monitoring_response(self, payload: Dict) -> str:
+        if not payload:
+            return "Monitoring response received but no data was provided."
+
+        lines = [
+            "Monitoring report ready.",
+            f"Risk score: {payload.get('risk_score', 'n/a')}",
+        ]
+        if payload.get("alert"):
+            lines.append("⚠️ Alert threshold reached.")
+        metrics = payload.get("metrics") or {}
+        if metrics:
+            lines.append("Key metrics:")
+            for key, value in metrics.items():
+                lines.append(f"- {key.replace('_', ' ').title()}: {value}")
+        issues = payload.get("issues") or []
+        if issues:
+            lines.append("Findings:")
+            lines.extend(f"- {item}" for item in issues)
+        return "\n".join(lines)
+
+    # =========================================================================
+    # Dynamic Discovery Methods (Agentverse Backup)
+    # =========================================================================
+
+    async def _discover_agents(self, ctx: Context) -> None:
+        """Discover missing agents from Agentverse as backup."""
+        # We only hit the Agentverse API when an address is absent or the cache has expired.
+        if not self.privacy_agent:
+            self.privacy_agent = await self._search_agent(ctx, "privacy", "privacy analysis")
+            if self.privacy_agent:
+                ctx.logger.info(f"🔍 Discovered privacy agent: {self.privacy_agent}")
+
+        if not self.execution_agent:
+            self.execution_agent = await self._search_agent(ctx, "execution", "swap transfer")
+            if self.execution_agent:
+                ctx.logger.info(f"🔍 Discovered execution agent: {self.execution_agent}")
+
+        if not self.monitoring_agent:
+            self.monitoring_agent = await self._search_agent(ctx, "monitoring", "mev detection")
+            if self.monitoring_agent:
+                ctx.logger.info(f"🔍 Discovered monitoring agent: {self.monitoring_agent}")
+
+    async def _search_agent(self, ctx: Context, agent_type: str, search_terms: str) -> Optional[str]:
+        """Search for agents on Agentverse."""
+        # Check cache first
+        cache_key = f"search_{agent_type}"
+        if cache_key in self._discovery_cache:
+            cached = self._discovery_cache[cache_key]
+            if (datetime.now().timestamp() - cached["timestamp"]) < self._cache_ttl:
+                return cached["address"]
+
+        try:
+            # Search Agentverse
+            url = "https://agentverse.ai/v1/search/agents"
+            headers = {"Content-Type": "application/json"}
+
+            # Use the chat protocol digest for filtering
+            data = {
+                "search_text": search_terms,
+                "sort": "relevancy",
+                "filters": {
+                    "protocol_digest": [chat_protocol_spec.digest]
+                },
+                "direction": "asc",
+                "offset": 0,
+                "limit": 5
+            }
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(url, json=data, headers=headers)
+                if response.status_code == 200:
+                    agents_data = response.json()
+                    agents = agents_data.get("agents", [])
+
+                    if agents:
+                        # Pick the most relevant agent
+                        best_agent = agents[0]
+                        address = best_agent.get("address")
+
+                        # Cache the result
+                        self._discovery_cache[cache_key] = {
+                            "address": address,
+                            "timestamp": datetime.now().timestamp()
+                        }
+
+                        ctx.logger.info(f"✅ Found {agent_type} agent: {best_agent.get('name', 'Unknown')}")
+                        return address
+                    else:
+                        ctx.logger.warning(f"❌ No {agent_type} agents found on Agentverse")
+                        return None
+                else:
+                    ctx.logger.error(f"❌ Agentverse search failed: {response.status_code}")
+                    return None
+
+        except Exception as e:
+            ctx.logger.error(f"❌ Error searching for {agent_type} agent: {e}")
+            return None
+
+    async def _get_agent_address(self, ctx: Context, agent_type: str) -> Optional[str]:
+        """Get agent address with dynamic discovery fallback."""
+        address_map = {
+            "privacy": self.privacy_agent,
+            "execution": self.execution_agent,
+            "monitoring": self.monitoring_agent
+        }
+
+        address = address_map.get(agent_type)
+
+        if not address:
+            # Try to discover it
+            ctx.logger.info(f"🔍 Attempting to discover {agent_type} agent...")
+            await self._discover_agents(ctx)
+            address = address_map.get(agent_type)
+
+        if address:
+            ctx.logger.info(f"✅ Using {agent_type} agent: {address}")
+        else:
+            ctx.logger.warning(f"❌ {agent_type} agent not available")
+
+        return address
+
+
+service = CoordinatorService()
+
 coordinator = Agent(
-    name="PrivAgent_Coordinator",
+    name="coordinator",
     port=int(os.getenv("AGENT_PORT_COORDINATOR", 8000)),
     mailbox=True,
     seed=os.getenv("COORDINATOR_SEED", "coordinator_seed_default"),
+    readme_path="README.md",
     endpoint=[f"http://127.0.0.1:{os.getenv('AGENT_PORT_COORDINATOR', 8000)}/submit"],
-    publish_agent_details=True  # CRITICAL for ASI:One discovery
+    publish_agent_details=True,
 )
 
-# Initialize chat protocol
 protocol = Protocol(spec=chat_protocol_spec)
-
-# Agent addresses (will be set after agents are deployed)
-PRIVACY_AGENT_ADDRESS = os.getenv("PRIVACY_AGENT_ADDRESS", "")
-EXECUTION_AGENT_ADDRESS = os.getenv("EXECUTION_AGENT_ADDRESS", "")
-MONITORING_AGENT_ADDRESS = os.getenv("MONITORING_AGENT_ADDRESS", "")
 
 
 @coordinator.on_event("startup")
-async def init_storage(ctx: Context):
-    """Initialize storage for user sessions"""
-    ctx.logger.info(f"Coordinator Agent started! Address: {coordinator.address}")
-    ctx.logger.info(f"Listening on port {os.getenv('AGENT_PORT_COORDINATOR', 8000)}")
-    ctx.logger.info("Ready to receive messages via ASI:One Chat Protocol")
-
-    ctx.storage.set("active_sessions", {})
-    ctx.storage.set("privacy_scores", {})
-    ctx.storage.set("pending_requests", {})
+async def on_startup(ctx: Context) -> None:
+    await service.startup(ctx)
 
 
 @protocol.on_message(ChatMessage)
-async def handle_user_message(ctx: Context, sender: str, msg: ChatMessage):
-    """
-    Main entry point for user interaction via ASI:One
-    CRITICAL: Always acknowledge FIRST, then process
-    """
-    ctx.logger.info(f"Received message from {sender}")
-
-    # STEP 1: Send acknowledgement IMMEDIATELY
-    await ctx.send(
-        sender,
-        ChatAcknowledgement(
-            timestamp=datetime.utcnow(),
-            acknowledged_msg_id=msg.msg_id
-        )
-    )
-
-    # STEP 2: Store session
-    session_id = str(msg.msg_id)
-    sessions = ctx.storage.get("active_sessions", {})
-    sessions[session_id] = {
-        "sender": sender,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    ctx.storage.set("active_sessions", sessions)
-
-    # STEP 3: Process message content
-    response_text = ""
-
-    for item in msg.content:
-        if isinstance(item, StartSessionContent):
-            response_text = get_welcome_message()
-
-        elif isinstance(item, TextContent):
-            user_text = item.text.lower()
-            ctx.logger.info(f"Processing user text: {user_text[:50]}...")
-
-            # Route to appropriate handler
-            response_text = await route_user_request(ctx, sender, user_text)
-
-        elif isinstance(item, EndSessionContent):
-            response_text = "👋 Session ended. Stay private! 🔐"
-            if session_id in sessions:
-                del sessions[session_id]
-                ctx.storage.set("active_sessions", sessions)
-
-    # STEP 4: Send response back to user
-    response = ChatMessage(
-        timestamp=datetime.utcnow(),
-        msg_id=uuid4(),
-        content=[TextContent(type="text", text=response_text)]
-    )
-    await ctx.send(sender, response)
+async def on_chat_message(ctx: Context, sender: str, message: ChatMessage) -> None:
+    await service.handle_chat_message(ctx, sender, message)
 
 
 @protocol.on_message(ChatAcknowledgement)
-async def handle_acknowledgement(ctx: Context, sender: str, msg: ChatAcknowledgement):
-    """Handle message acknowledgements"""
-    ctx.logger.info(f"Message {msg.acknowledged_msg_id} acknowledged by {sender}")
+async def on_chat_ack(ctx: Context, sender: str, message: ChatAcknowledgement) -> None:
+    ctx.logger.debug("message %s acknowledged by %s", message.acknowledged_msg_id, sender)
 
 
 @coordinator.on_message(PrivacyResponse)
-async def handle_privacy_response(ctx: Context, sender: str, msg: PrivacyResponse):
-    """Handle async response from Privacy Agent - CRUCIAL for real communication"""
-    ctx.logger.info(f"Received privacy response for request {msg.request_id}")
-
-    # Get pending request
-    pending = ctx.storage.get("pending_requests", {})
-
-    if msg.request_id not in pending:
-        ctx.logger.warning(f"Unknown request ID: {msg.request_id}")
-        return
-
-    request_info = pending[msg.request_id]
-    original_sender = request_info["sender"]
-
-    # Format response based on action
-    if request_info["action"] == "compress":
-        response_text = format_compression_response(msg.result, msg.success)
-    elif request_info["action"] == "report":
-        response_text = format_privacy_report(msg.result, msg.success)
-    elif request_info["action"] == "score":
-        response_text = format_privacy_score(msg.result, msg.success)
-    else:
-        response_text = f"Privacy operation completed. Success: {msg.success}"
-
-    # Send response back to user
-    await ctx.send(
-        original_sender,
-        ChatMessage(
-            timestamp=datetime.utcnow(),
-            msg_id=uuid4(),
-            content=[TextContent(type="text", text=response_text)]
-        )
-    )
-
-    # Clean up pending request
-    del pending[msg.request_id]
-    ctx.storage.set("pending_requests", pending)
+async def on_privacy_response(ctx: Context, sender: str, message: PrivacyResponse) -> None:
+    await service.receive_privacy_response(ctx, sender, message)
 
 
 @coordinator.on_message(ExecutionResponse)
-async def handle_execution_response(ctx: Context, sender: str, msg: ExecutionResponse):
-    """Handle async response from Execution Agent"""
-    ctx.logger.info(f"Received execution response for request {msg.request_id}")
+async def on_execution_response(ctx: Context, sender: str, message: ExecutionResponse) -> None:
+    await service.receive_execution_response(ctx, sender, message)
 
-    pending = ctx.storage.get("pending_requests", {})
 
-    if msg.request_id not in pending:
-        ctx.logger.warning(f"Unknown execution request ID: {msg.request_id}")
-        return
-
-    request_info = pending[msg.request_id]
-    original_sender = request_info["sender"]
-
-    response_text = format_execution_response(msg.result, msg.success, msg.signature)
-
-    await ctx.send(
-        original_sender,
-        ChatMessage(
-            timestamp=datetime.utcnow(),
-            msg_id=uuid4(),
-            content=[TextContent(type="text", text=response_text)]
-        )
-    )
-
-    del pending[msg.request_id]
-    ctx.storage.set("pending_requests", pending)
+@coordinator.on_message(MonitoringResponse)
+async def on_monitoring_response(ctx: Context, sender: str, message: MonitoringResponse) -> None:
+    await service.receive_monitoring_response(ctx, sender, message)
 
 
 @coordinator.on_message(PrivacyAlert)
-async def handle_privacy_alert(ctx: Context, sender: str, msg: PrivacyAlert):
-    """Handle privacy alerts from Monitoring Agent"""
-    ctx.logger.info(f"Received privacy alert: {msg.alert_type} for {msg.wallet_address}")
+async def on_privacy_alert(ctx: Context, sender: str, message: PrivacyAlert) -> None:
+    await service.receive_privacy_alert(ctx, sender, message)
 
-    # Store alert
-    alerts = ctx.storage.get("privacy_alerts", [])
-    alerts.append({
-        "alert_type": msg.alert_type,
-        "wallet": msg.wallet_address,
-        "severity": msg.severity,
-        "message": msg.message,
-        "timestamp": msg.timestamp
-    })
-    ctx.storage.set("privacy_alerts", alerts)
 
-    # Find sessions monitoring this wallet
-    sessions = ctx.storage.get("active_sessions", {})
-    for session_id, session_info in sessions.items():
-        # TODO: Implement wallet-to-session mapping
-        pass
-
-
-def format_compression_response(result: dict, success: bool) -> str:
-    """Format compression response for user"""
-    if not success:
-        return f"""❌ Compression Failed
-
-{result.get('error', 'Unknown error occurred')}
-
-**Troubleshooting:**
-• Check wallet address is correct
-• Ensure sufficient balance
-• Verify Light CLI is installed
-
-Need help? Just ask! 💬"""
-
-    return f"""✅ Compression Successful!
-
-**Transaction Details:**
-• Signature: {result.get('signature', 'Processing...')[:8]}...
-• Status: {result.get('status', 'Confirmed')}
-• Gas Saved: ~{result.get('gas_saved', '99.9%')}
-
-**Privacy Benefits:**
-✅ Account compressed
-✅ 99.9% storage cost reduction
-✅ ZK proof verification
-✅ Enhanced privacy
-
-View transaction: {result.get('explorer_url', 'Loading...')}
-
-Your tokens are now compressed! 🎉"""
-
-
-def format_privacy_report(result: dict, success: bool) -> str:
-    """Format privacy report for user"""
-    if not success:
-        return f"❌ Failed to generate privacy report: {result.get('error', 'Unknown error')}"
-
-    score = result.get('privacy_score', 0)
-    grade = get_privacy_grade(score)
-
-    return f"""📊 Privacy Report Complete
-
-**Your Privacy Score: {score}/100 (Grade: {grade})**
-
-{format_privacy_breakdown(result.get('breakdown', {}))}
-
-{format_recommendations(result.get('recommendations', []))}
-
-Want to improve your score? Just ask! 🚀"""
-
-
-def format_privacy_score(result: dict, success: bool) -> str:
-    """Format privacy score for user"""
-    return format_privacy_report(result, success)
-
-
-def format_execution_response(result: dict, success: bool, signature: str = None) -> str:
-    """Format execution response for user"""
-    if not success:
-        return f"""❌ Transaction Failed
-
-{result.get('error', 'Unknown error occurred')}
-
-**Troubleshooting:**
-• Check wallet balance
-• Verify recipient address
-• Ensure sufficient gas fees
-
-Need help? Ask me! 💬"""
-
-    return f"""✅ Transaction Successful!
-
-**Details:**
-• Signature: {signature[:8] if signature else 'Processing...'}...
-• Status: {result.get('status', 'Confirmed')}
-• Privacy: {result.get('privacy_level', 'Standard')}
-• MEV Protection: {'Active' if result.get('mev_protection') else 'Inactive'}
-
-View on Solscan: {result.get('explorer_url', 'Loading...')}
-
-Transaction completed with privacy features! 🔐"""
-
-
-def get_privacy_grade(score: int) -> str:
-    """Convert privacy score to letter grade"""
-    if score >= 90:
-        return "A+"
-    elif score >= 80:
-        return "A"
-    elif score >= 70:
-        return "B"
-    elif score >= 60:
-        return "C"
-    elif score >= 50:
-        return "D"
-    else:
-        return "F"
-
-
-def format_privacy_breakdown(breakdown: dict) -> str:
-    """Format privacy score breakdown"""
-    if not breakdown:
-        return "**Score Breakdown:** Not available"
-
-    lines = ["**Score Breakdown:**"]
-    for category, score in breakdown.items():
-        emoji = "✅" if score >= 7 else "⚠️" if score >= 5 else "❌"
-        lines.append(f"{emoji} {category.title()}: {score}/10")
-
-    return "\n".join(lines)
-
-
-def format_recommendations(recs: list) -> str:
-    """Format privacy recommendations"""
-    if not recs:
-        return "**All privacy practices are excellent!**"
-
-    lines = ["**Recommendations:**"]
-    for i, rec in enumerate(recs[:5], 1):  # Limit to 5 recommendations
-        lines.append(f"{i}. {rec}")
-
-    return "\n".join(lines)
-
-
-async def route_user_request(ctx: Context, sender: str, user_text: str) -> str:
-    """Route user request to appropriate function based on intent"""
-
-    # Pattern matching for user intent
-    if any(word in user_text for word in ["compress", "compression", "reduce cost"]):
-        return await handle_compression_request(ctx, sender, user_text)
-
-    elif any(word in user_text for word in ["send", "transfer", "pay"]):
-        return await handle_transfer_request(ctx, sender, user_text)
-
-    elif any(word in user_text for word in ["privacy score", "check privacy", "privacy report"]):
-        return await handle_privacy_check(ctx, sender, user_text)
-
-    elif any(word in user_text for word in ["protect swap", "mev", "swap"]):
-        return await handle_swap_request(ctx, sender, user_text)
-
-    elif any(word in user_text for word in ["monitor", "watch", "alert"]):
-        return await handle_monitoring_request(ctx, sender, user_text)
-
-    elif any(word in user_text for word in ["help", "commands", "what can you do"]):
-        return get_help_message()
-
-    elif any(word in user_text for word in ["hello", "hi", "hey"]):
-        return get_welcome_message()
-
-    else:
-        return get_default_message()
-
-
-async def handle_compression_request(ctx: Context, sender: str, user_text: str) -> str:
-    """Handle token compression requests with REAL agent communication"""
-    ctx.logger.info("Handling compression request")
-
-    # Extract wallet address and amount from user text
-    wallet_match = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', user_text)
-    amount_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:usdc|sol|tokens?)', user_text)
-
-    if not wallet_match:
-        return """❌ Missing wallet address
-
-Please provide your wallet address for compression.
-
-**Example:** "Compress 1000 USDC from wallet Gx7UJ7..."
-Your wallet address starts with 'Gx7UJ7...' or similar format."""
-
-    wallet_address = wallet_match.group()
-    amount = float(amount_match.group(1)) if amount_match else None
-
-    # Check if Privacy Agent is available
-    if not PRIVACY_AGENT_ADDRESS:
-        return """⚠️ Privacy Agent not configured
-
-Please ensure the Privacy Agent is running and set PRIVACY_AGENT_ADDRESS in your environment.
-
-**For demo purposes, I can show you what would happen:**
-- Your tokens would be compressed using Light Protocol
-- Storage costs reduced by 99.9%
-- ZK proofs ensure security and privacy"""
-
-    # Generate unique request ID
-    request_id = str(uuid4())
-
-    # Store pending request
-    pending = ctx.storage.get("pending_requests", {})
-    pending[request_id] = {
-        "sender": sender,
-        "action": "compress",
-        "wallet_address": wallet_address,
-        "amount": amount,
-        "timestamp": datetime.utcnow().isoformat(),
-        "status": "waiting"
-    }
-    ctx.storage.set("pending_requests", pending)
-
-    # Send REAL request to Privacy Agent
-    try:
-        await ctx.send(
-            PRIVACY_AGENT_ADDRESS,
-            PrivacyRequest(
-                action="compress",
-                wallet_address=wallet_address,
-                amount=amount,
-                request_id=request_id
-            )
-        )
-
-        return """🔄 Processing Compression Request
-
-I've sent your request to the Privacy Agent for processing!
-
-**Request Details:**
-- Wallet: {wallet[:8]}...{wallet[-8:]}
-- Amount: {amount if amount else 'Not specified'}
-- Request ID: {req_id[:8]}...
-
-**What happens next:**
-1. ✅ Privacy Agent validates the request
-2. 🔄 Light Protocol compression is executed
-3. ✅ Transaction confirmation and proof generation
-
-Please wait while I process your request... ⏳
-
-*This is REAL agent communication - not a simulation!* ✨""".format(
-            wallet=wallet_address,
-            amount=amount if amount else 'Not specified',
-            req_id=request_id
-        )
-
-    except Exception as e:
-        ctx.logger.error(f"Failed to send privacy request: {e}")
-        return f"""❌ Error sending request
-
-Failed to communicate with Privacy Agent: {str(e)}
-
-**Troubleshooting:**
-1. Ensure Privacy Agent is running on port 8001
-2. Check network connectivity
-3. Verify PRIVACY_AGENT_ADDRESS is correct
-
-For demo purposes, your compression would be processed using Light Protocol ZK compression."""
-
-
-async def handle_transfer_request(ctx: Context, sender: str, user_text: str) -> str:
-    """Handle private transfer requests"""
-    ctx.logger.info("Handling transfer request")
-
-    # Extract amount if present
-    amount_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:usdc|sol|tokens?)', user_text)
-    amount = amount_match.group(1) if amount_match else "amount"
-
-    return f"""💸 Private Transfer Request
-
-I can help you send {amount} privately using compressed transfers!
-
-**Privacy Features:**
-• ✅ Compressed state (99.9% cost reduction)
-• ✅ Reduced on-chain footprint
-• ✅ ZK proof verification
-• ✅ MEV protection options
-
-**To execute a private transfer, provide:**
-1. Amount and token (e.g., "100 USDC")
-2. Recipient address
-3. Privacy level (standard/max)
-
-**Example:** "Send 100 USDC to {sender[:8]}... with max privacy"
-
-Demo mode active - showcasing privacy capabilities! 🔐"""
-
-
-async def handle_privacy_check(ctx: Context, sender: str, user_text: str) -> str:
-    """Handle privacy score check requests with REAL agent communication"""
-    ctx.logger.info("Handling privacy check request")
-
-    # Extract wallet address from user text
-    wallet_match = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', user_text)
-
-    # If no wallet provided, use sender's address as fallback
-    if not wallet_match:
-        return """❌ Missing wallet address
-
-Please provide your wallet address for privacy analysis.
-
-**Example:** "Check privacy score for wallet Gx7UJ7..."
-Your wallet address starts with 'Gx7UJ7...' or similar format.
-
-*For demo purposes, I can analyze a sample wallet if you say "demo score"*"""
-
-    wallet_address = wallet_match.group()
-
-    # Check if Privacy Agent is available
-    if not PRIVACY_AGENT_ADDRESS:
-        return """⚠️ Privacy Agent not configured
-
-Please ensure to set PRIVACY_AGENT_ADDRESS in your environment.
-
-**For demo purposes, your score would be calculated using:**
-• Account compression analysis
-• Transaction pattern detection
-• Address reuse metrics
-• Timing correlation analysis"""
-
-    # Generate unique request ID
-    request_id = str(uuid4())
-
-    # Store pending request
-    pending = ctx.storage.get("pending_requests", {})
-    pending[request_id] = {
-        "sender": sender,
-        "action": "score",
-        "wallet_address": wallet_address,
-        "timestamp": datetime.utcnow().isoformat(),
-        "status": "waiting"
-    }
-    ctx.storage.set("pending_requests", pending)
-
-    # Send REAL request to Privacy Agent
-    try:
-        await ctx.send(
-            PRIVACY_AGENT_ADDRESS,
-            PrivacyRequest(
-                action="score",
-                wallet_address=wallet_address,
-                request_id=request_id
-            )
-        )
-
-        return """📊 Analyzing Privacy Score
-
-I'm analyzing your wallet's privacy now...
-
-**Analysis Details:**
-- Wallet: {wallet[:8]}...{wallet[-8:]}
-- Request ID: {req_id[:8]}...
-
-**What I'm checking:**
-🔍 Account compression ratio
-🔍 Transaction pattern analysis
-🔍 Address reuse frequency
-🔍 Timing correlation detection
-🔍 MEV exposure assessment
-
-This may take a few moments as I analyze your on-chain activity... ⏳
-
-*Using REAL blockchain analysis - not simulated scores!* 🔍""".format(
-            wallet=wallet_address,
-            req_id=request_id
-        )
-
-    except Exception as e:
-        ctx.logger.error(f"Failed to send privacy score request: {e}")
-        return f"""❌ Error starting analysis
-
-Failed to communicate with Privacy Agent: {str(e)}
-
-**Troubleshooting:**
-1. Ensure Privacy Agent is running on port 8001
-2. Check network connectivity
-3. Verify PRIVACY_AGENT_ADDRESS is correct
-
-For demo purposes, your privacy score would be calculated using real Solana blockchain data."""
-
-
-async def handle_swap_request(ctx: Context, sender: str, user_text: str) -> str:
-    """Handle MEV-protected swap requests"""
-    ctx.logger.info("Handling swap request")
-
-    return """🛡️ MEV-Protected Swap
-
-I can protect your swaps from MEV (Maximal Extractable Value) attacks!
-
-**Protection Layers:**
-1. ✅ Pre-execution simulation
-2. ✅ Frontrunning detection
-3. ✅ Slippage protection (0.5%)
-4. ✅ Network congestion analysis
-5. ✅ Optimal timing calculation
-
-**Current Network Status:**
-• TPS: 1,842 (Low congestion ✅)
-• MEV Risk: LOW
-• Recommended: Execute now
-
-**To swap with protection:**
-"Swap 1 SOL for USDC with MEV protection"
-
-**Example output:**
-• Input: 1 SOL
-• Expected output: ~198.5 USDC
-• Price impact: 0.2%
-• Protection: Active
-• Estimated savings from MEV: $12-15
-
-Ready to protect your next trade! 🚀"""
-
-
-async def handle_monitoring_request(ctx: Context, sender: str, user_text: str) -> str:
-    """Handle wallet monitoring requests"""
-    ctx.logger.info("Handling monitoring request")
-
-    return """👁️ Privacy Monitoring
-
-I can monitor your wallet for privacy issues and send alerts!
-
-**What I Monitor:**
-• Privacy score changes
-• Suspicious transaction patterns
-• Address reuse detection
-• Timing correlation analysis
-• Compression usage
-
-**Alert Thresholds:**
-• 🟢 Score 80+: Excellent (no alerts)
-• 🟡 Score 60-79: Good (monthly summary)
-• 🟠 Score 40-59: Fair (weekly alerts)
-• 🔴 Score <40: Poor (immediate alerts)
-
-**To enable monitoring:**
-"Monitor wallet {sender[:8]}... with threshold 70"
-
-**Example Alert:**
-⚠️  Privacy Alert for wallet Gx7U...
-Score dropped to 65/100
-Issues: High address reuse detected
-Recommendation: Create new receiving addresses
-
-Want to set up monitoring? Let me know! 📡"""
-
-
-def get_welcome_message() -> str:
-    """Get welcome message for new sessions"""
-    return """👋 Welcome to PrivAgent!
-
-I'm your privacy-first AI agent for Solana. I help you:
-
-🔐 **Compress tokens** - 99.9% cost savings with ZK proofs
-💸 **Private transfers** - Reduced on-chain footprint
-🛡️ **MEV protection** - Shield your swaps from frontrunning
-📊 **Privacy scoring** - Analyze & improve your privacy
-👁️ **Monitoring** - Real-time privacy alerts
-
-**Quick Commands:**
-• "Compress my tokens"
-• "Check my privacy score"
-• "Send 100 USDC privately"
-• "Protect this swap from MEV"
-• "Monitor my wallet"
-• "Help"
-
-What would you like to do? 🚀"""
-
-
-def get_help_message() -> str:
-    """Get help message with available commands"""
-    return """📖 PrivAgent Help
-
-**Available Commands:**
-
-🔐 **Compression**
-• "Compress my tokens"
-• "Compress 1000 USDC"
-
-💸 **Transfers**
-• "Send 100 USDC to [address] privately"
-• "Transfer tokens with compression"
-
-📊 **Privacy**
-• "Check my privacy score"
-• "Privacy report"
-• "How private am I?"
-
-🛡️ **MEV Protection**
-• "Protect my swap from MEV"
-• "Swap 1 SOL for USDC safely"
-
-👁️ **Monitoring**
-• "Monitor my wallet"
-• "Set privacy alerts"
-
-**Features:**
-✅ ZK Compression (99.9% cost savings)
-✅ Privacy scoring with recommendations
-✅ MEV protection for swaps
-✅ Real-time monitoring & alerts
-
-**Example Conversations:**
-"I want to compress 1000 USDC to save on rent"
-"Check if my recent transactions exposed my privacy"
-"Protect my next swap from frontrunning"
-
-Need help with something specific? Just ask! 💬"""
-
-
-def get_default_message() -> str:
-    """Get default message for unknown requests"""
-    return """🤔 I'm not sure what you're asking for.
-
-I can help you with:
-• **Compress** - Reduce storage costs with ZK proofs
-• **Transfer** - Send tokens privately
-• **Privacy** - Check and improve your privacy score
-• **Protect** - Shield swaps from MEV
-• **Monitor** - Set up privacy alerts
-
-Try saying:
-• "Compress my tokens"
-• "Check my privacy score"
-• "Help"
-
-What would you like to do? 🚀"""
-
-
-# Include protocol in agent with manifest publishing
-coordinator.include(protocol, publish_manifest=True)
-
-
-if __name__ == "__main__":
-    print(f"Coordinator Agent Address: {coordinator.address}")
-    print(f"Starting on port {os.getenv('AGENT_PORT_COORDINATOR', 8000)}...")
-    coordinator.run()
+coordinator.include(protocol)

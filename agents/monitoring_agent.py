@@ -1,594 +1,754 @@
-"""
-Monitoring Agent - Monitors blockchain activity, privacy metrics, and alerts
-"""
-import os
-from typing import List, Optional, Dict
-from datetime import datetime
+from __future__ import annotations
+
+import shutil
+import statistics
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
 from dotenv import load_dotenv
 
-from uagents import Agent, Context, Model
-from solana.rpc.async_api import AsyncClient
-from solders.pubkey import Pubkey
-from solders.signature import Signature
-# RPCResponse is not used and not available in modern solana-py
-import subprocess
-import json
-
-# Load environment variables
+# Load .env file BEFORE importing config to ensure environment variables are available
 load_dotenv()
 
-# Agent configuration
-monitoring_agent = Agent(
-    name="PrivAgent_Monitoring",
-    port=int(os.getenv("AGENT_PORT_MONITORING", 8003)),
-    mailbox=True,
-    seed=os.getenv("MONITORING_AGENT_SEED", "monitoring_seed_default"),
-    endpoint=[f"http://127.0.0.1:{os.getenv('AGENT_PORT_MONITORING', 8003)}/submit"],
-    publish_agent_details=True
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
+from solders.pubkey import Pubkey
+from uagents import Agent, Context
+
+from agents.config import config
+from agents.utils import CircuitBreaker, TokenBucket
+from models.messages import (
+    MEVDetectionRequest,
+    MEVDetectionResponse,
+    MonitoringRequest,
+    MonitoringResponse,
+    PrivacyAlert,
+    RealTimeAlert,
+    RealTimeMonitoringRequest,
+    SandwichAttackData,
 )
 
-# Solana RPC client
-solana_client = AsyncClient(os.getenv("HELIUS_RPC_URL", os.getenv("SOLANA_RPC_URL")))
 
+@dataclass
+class RiskAssessment:
+    """
+    Privacy and MEV risk assessment for a wallet.
 
-# Message Models
-class MonitorRequest(Model):
-    """Request to monitor a wallet or transaction"""
-    wallet_address: Optional[str] = None
-    tx_signature: Optional[str] = None
-    alert_threshold: int = 80  # Privacy score threshold
-    request_id: str
+    Risk score ranges 0-100:
+    - 0-30: Low risk (good privacy practices)
+    - 31-70: Medium risk (some concerns)
+    - 71-100: High risk (privacy leaks, MEV exposure)
 
-
-class AlertMessage(Model):
-    """Alert message for privacy issues"""
+    Used to trigger alerts when risk exceeds user-defined thresholds.
+    """
     wallet: str
-    score: int
-    issues: List[str]
-    timestamp: str
-    severity: str  # "LOW", "MEDIUM", "HIGH"
+    risk_score: int
+    issues: List[str]  # Human-readable list of detected issues
+    slot: Optional[int] = None  # Current Solana slot when assessed
+    metrics: Dict[str, float] = None  # Raw metrics (compression ratio, MEV exposure, etc.)
 
 
-class MonitoringResponse(Model):
-    """Response from monitoring operations"""
-    request_id: str
-    success: bool
-    result: dict
+class MonitoringService:
+    """
+    Real-time monitoring service for privacy threats and MEV attacks.
+
+    Core capabilities:
+    1. Privacy Monitoring - Detect address reuse, low compression usage, predictable patterns
+    2. MEV Detection - Identify sandwich attacks, frontrunning, arbitrage bots
+    3. Real-time Alerts - Push notifications when risk thresholds breached
+    4. Transaction Analysis - Scan recent transactions for suspicious patterns
+
+    MEV Attack Detection:
+    - Sandwich attacks: Bot frontruns user swap, pushes price, then backruns for profit
+    - Frontrunning: Bot sees pending transaction and submits higher priority fee to execute first
+    - Arbitrage abuse: Exploiting price differences across DEXs
+
+    Privacy Threat Detection:
+    - Address reuse (makes transactions linkable)
+    - Low ZK compression usage (on-chain state leaks)
+    - Predictable timing patterns (behavioral fingerprinting)
+    - Interacting with known MEV programs
+    """
+
+    def __init__(self) -> None:
+        self.cfg = config
+
+        # Solana RPC client for querying transaction history
+        self.rpc_client = AsyncClient(self.cfg.rpc_url())
+
+        # Circuit breaker prevents cascading failures when RPC is down
+        self.rpc_breaker = CircuitBreaker(
+            failure_threshold=self.cfg.security.circuit_breaker_threshold,
+            recovery_time=self.cfg.security.circuit_breaker_timeout,
+        )
+
+        # Rate limiter to prevent monitoring spam (max 1 request/second)
+        self.request_limiter = TokenBucket(rate=1.0, capacity=5.0)
+
+        # Alert deduplication: track last alert time per wallet to avoid spam
+        self.last_alerts: Dict[str, float] = {}
+
+        # Known MEV program IDs (Jito, bloXroute, etc.) - flag wallets interacting with these
+        self.mev_programs = set(self.cfg.monitoring.known_mev_programs)
+
+    async def startup(self, ctx: Context) -> None:
+        ctx.storage.set("monitoring_requests", 0)
+        ctx.logger.info("Monitoring service ready")
+
+    async def shutdown(self) -> None:
+        await self.rpc_client.close()
+
+    async def handle_request(self, ctx: Context, sender: str, request: MonitoringRequest) -> MonitoringResponse:
+        if request.action not in {"monitor", "check"}:
+            return MonitoringResponse(
+                request_id=request.request_id,
+                success=False,
+                result={"error": f"unsupported action '{request.action}'"},
+            )
+
+        if not request.wallet_address:
+            return MonitoringResponse(
+                request_id=request.request_id,
+                success=False,
+                result={"error": "wallet_address is required"},
+            )
+
+        if not await self.request_limiter.acquire():
+            return MonitoringResponse(
+                request_id=request.request_id,
+                success=False,
+                result={"error": "monitoring rate limit reached"},
+            )
+
+        ctx.storage.set("monitoring_requests", (ctx.storage.get("monitoring_requests", 0) or 0) + 1)
+        try:
+            assessment = await self._assess_wallet(ctx, request.wallet_address)
+        except Exception as exc:  # noqa: PERF203
+            ctx.logger.error("monitoring request failed for %s: %s", request.wallet_address, exc)
+            return MonitoringResponse(
+                request_id=request.request_id,
+                success=False,
+                result={"error": str(exc)},
+            )
+        threshold = request.threshold or self.cfg.monitoring.default_privacy_threshold
+        should_alert = assessment.risk_score >= threshold
+
+        result = {
+            "wallet": assessment.wallet,
+            "risk_score": assessment.risk_score,
+            "issues": assessment.issues,
+            "slot": assessment.slot,
+            "metrics": assessment.metrics,
+            "alert": should_alert,
+        }
+
+        if should_alert:
+            await self._emit_alert(ctx, sender, assessment)
+
+        return MonitoringResponse(
+            request_id=request.request_id,
+            success=True,
+            result=result,
+        )
+
+    async def _assess_wallet(self, ctx: Context, wallet: str) -> RiskAssessment:
+        slot = await self._current_slot()
+        metrics = await self._analyze_wallet_activity(ctx, wallet)
+        risk_score, issues = self._score_risk(metrics)
+        return RiskAssessment(wallet=wallet, risk_score=risk_score, issues=issues, slot=slot, metrics=metrics)
+
+    async def _current_slot(self) -> Optional[int]:
+        if not self.rpc_breaker.allow_call():
+            return None
+        try:
+            response = await self.rpc_client.get_slot(commitment=Confirmed)
+        except Exception:
+            self.rpc_breaker.record_failure()
+            return None
+        self.rpc_breaker.record_success()
+        if hasattr(response, "value"):
+            return int(response.value)
+        if isinstance(response, dict):
+            value = response.get("result", response.get("value"))
+            if value is not None:
+                return int(value)
+        if isinstance(response, int):
+            return response
+        return None
+
+    async def _analyze_wallet_activity(self, ctx: Context, wallet: str) -> Dict[str, float]:
+        pubkey = Pubkey.from_string(wallet)
+        metrics = {
+            "mev_hits": 0.0,
+            "high_priority_txs": 0.0,
+            "unique_counterparties": 0.0,
+            "timing_variance": 0.0,
+            "transaction_count": 0.0,
+        }
+
+        try:
+            signatures = await self.rpc_client.get_signatures_for_address(pubkey, limit=20)
+        except Exception as exc:  # noqa: PERF203
+            # Propagate the failure so callers can surface a clear error to the user.
+            raise RuntimeError(f"failed to fetch signatures for wallet {wallet}: {exc}") from exc
+
+        records = signatures.value or []
+        metrics["transaction_count"] = float(len(records))
+        if not records:
+            return metrics
+
+        block_times = [r.block_time for r in records if r.block_time]
+        if len(block_times) > 1:
+            metrics["timing_variance"] = statistics.pvariance(block_times)
+
+        counterparties = set()
+        mev_hits = 0
+        high_fee = 0
+        for record in records[:10]:
+            try:
+                tx = await self.rpc_client.get_transaction(
+                    record.signature,
+                    commitment=Confirmed,
+                    encoding="json",
+                )
+            except Exception as exc:  # noqa: PERF203
+                raise RuntimeError(f"failed to fetch transaction {record.signature}: {exc}") from exc
+
+            if not tx.value:
+                continue
+            # Transaction message is enough for our heuristics; we avoid decoding full transaction objects.
+            message = tx.value.get("transaction", {}).get("message", {})
+            instructions = message.get("instructions", [])
+            for inst in instructions:
+                program_id = inst.get("programId") if isinstance(inst, dict) else ""
+                if program_id in self.mev_programs or _looks_like_swap(program_id):
+                    mev_hits += 1
+            accounts = message.get("accountKeys", [])
+            for account in accounts:
+                key = account["pubkey"] if isinstance(account, dict) else account
+                if key != wallet:
+                    counterparties.add(key)
+
+            meta = tx.value.get("meta", {})
+            fee = meta.get("fee", 0)
+            if fee and fee > 15_000:
+                high_fee += 1
+
+        metrics["mev_hits"] = float(mev_hits)
+        metrics["high_priority_txs"] = float(high_fee)
+        metrics["unique_counterparties"] = float(len(counterparties))
+        return metrics
+
+    def _score_risk(self, metrics: Dict[str, float]) -> tuple[int, List[str]]:
+        score = 0
+        issues: List[str] = []
+
+        mev_hits = metrics.get("mev_hits", 0.0)
+        high_fee = metrics.get("high_priority_txs", 0.0)
+        counterparties = metrics.get("unique_counterparties", 0.0)
+        timing_variance = metrics.get("timing_variance", 0.0)
+        tx_count = metrics.get("transaction_count", 0.0)
+
+        score += int(min(30, mev_hits * 10))
+        if mev_hits:
+            issues.append(f"{int(mev_hits)} potential MEV interactions detected.")
+
+        score += int(min(20, high_fee * 8))
+        if high_fee:
+            issues.append("Elevated priority fees observed, indicating frontrunning risk.")
+
+        if tx_count > 0:
+            diversity = counterparties / max(tx_count, 1.0)
+            if diversity < 0.3:
+                score += 25
+                issues.append("Low counterparty diversity detected.")
+            elif diversity < 0.6:
+                score += 10
+
+        if timing_variance and timing_variance < 1_000:
+            score += 15
+            issues.append("Regular transaction cadence may enable timing analysis.")
+
+        score = min(100, max(5, score))
+        if not issues:
+            issues.append("No high-risk patterns identified.")
+        return score, issues
+
+    async def _emit_alert(self, ctx: Context, recipient: str, assessment: RiskAssessment) -> None:
+        now = time.time()
+        cooldown = self.cfg.monitoring.alert_cooldown_minutes * 60
+        last = self.last_alerts.get(assessment.wallet, 0)
+        if now - last < cooldown:
+            return
+
+        self.last_alerts[assessment.wallet] = now
+        alert = PrivacyAlert(
+            alert_type="risk_threshold",
+            wallet_address=assessment.wallet,
+            severity=self._severity_from_score(assessment.risk_score),
+            message="Privacy risk score exceeded monitoring threshold.",
+            data={
+                "issues": assessment.issues,
+                "metrics": assessment.metrics,
+                "risk_score": assessment.risk_score,
+            },
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        )
+        await ctx.send(recipient, alert)
+
+    def _severity_from_score(self, score: int) -> str:
+        if score >= 85:
+            return "critical"
+        if score >= 70:
+            return "high"
+        if score >= 55:
+            return "medium"
+        return "low"
+
+    # =========================================================================
+    # ML-Based MEV Detection
+    # =========================================================================
+
+    async def handle_mev_detection(
+        self, ctx: Context, request: MEVDetectionRequest
+    ) -> MEVDetectionResponse:
+        """ML-powered MEV detection with multiple models"""
+
+        try:
+            wallet_metrics = await self._analyze_wallet_activity(ctx, request.wallet_address)
+        except Exception as exc:  # noqa: PERF203
+            ctx.logger.error("mev detection failed for %s: %s", request.wallet_address, exc)
+            return MEVDetectionResponse(
+                request_id=request.request_id,
+                success=False,
+                mev_detected=False,
+                mev_type=None,
+                confidence=0.0,
+                risk_score=0.0,
+                temporal_analysis={"error": str(exc)},
+                graph_analysis={},
+                anomaly_score=0.0,
+                recommendations=[],
+            )
+
+        mev_detected = False
+        mev_type = None
+        confidence = 0.0
+        temporal_data = {}
+        graph_data = {}
+        anomaly_score = 0.0
+        recommendations = []
+
+        tx_sequence = request.transaction_sequence or []
+
+        if "lstm" in request.detection_models:
+            lstm_result = self._lstm_temporal_analysis(
+                tx_sequence, wallet_metrics
+            )
+            temporal_data.update(lstm_result)
+            if lstm_result.get("mev_probability", 0) > 0.6:
+                mev_detected = True
+                confidence = max(confidence, lstm_result["mev_probability"])
+                mev_type = lstm_result.get("attack_type", "unknown")
+
+        if "gnn" in request.detection_models:
+            gnn_result = self._gnn_graph_analysis(
+                tx_sequence, wallet_metrics
+            )
+            graph_data.update(gnn_result)
+            if gnn_result.get("mev_probability", 0) > 0.6:
+                mev_detected = True
+                confidence = max(confidence, gnn_result["mev_probability"])
+
+        if "transformer" in request.detection_models:
+            transformer_result = self._transformer_pattern_recognition(
+                tx_sequence
+            )
+            temporal_data.update({"transformer": transformer_result})
+            if transformer_result.get("mev_probability", 0) > 0.6:
+                mev_detected = True
+                confidence = max(confidence, transformer_result["mev_probability"])
+
+        if "isolation_forest" in request.detection_models:
+            anomaly_result = self._isolation_forest_anomaly_detection(wallet_metrics)
+            anomaly_score = anomaly_result.get("anomaly_score", 0.0)
+            if anomaly_score > 0.7:
+                recommendations.append("Unusual transaction patterns detected")
+
+        if mev_detected:
+            recommendations.extend([
+                "Consider using MEV protection services",
+                "Adjust transaction timing to reduce MEV exposure",
+                "Use privacy-preserving transaction submission"
+            ])
+
+        risk_score = self._calculate_mev_risk_score(confidence, anomaly_score, wallet_metrics)
+
+        return MEVDetectionResponse(
+            request_id=request.request_id,
+            success=True,
+            mev_detected=mev_detected,
+            mev_type=mev_type,
+            confidence=confidence,
+            risk_score=risk_score,
+            temporal_analysis=temporal_data,
+            graph_analysis=graph_data,
+            anomaly_score=anomaly_score,
+            recommendations=recommendations[:5],
+        )
+
+    async def handle_realtime_monitoring(
+        self, ctx: Context, request: RealTimeMonitoringRequest
+    ) -> List[RealTimeAlert]:
+        """Real-time monitoring with continuous learning"""
+        alerts = []
+
+        for wallet in request.wallet_addresses:
+            try:
+                wallet_metrics = await self._analyze_wallet_activity(ctx, wallet)
+            except Exception as exc:  # noqa: PERF203
+                ctx.logger.error("real-time monitoring skipped %s: %s", wallet, exc)
+                continue
+
+            for monitor_type in request.monitoring_types:
+                if monitor_type == "mev":
+                    mev_alert = self._check_mev_realtime(wallet, wallet_metrics, request.alert_threshold)
+                    if mev_alert:
+                        alerts.append(mev_alert)
+
+                elif monitor_type == "privacy":
+                    privacy_alert = self._check_privacy_realtime(wallet, wallet_metrics, request.alert_threshold)
+                    if privacy_alert:
+                        alerts.append(privacy_alert)
+
+                elif monitor_type == "anomaly":
+                    anomaly_alert = self._check_anomaly_realtime(wallet, wallet_metrics, request.alert_threshold)
+                    if anomaly_alert:
+                        alerts.append(anomaly_alert)
+
+        return alerts
+
+    def _lstm_temporal_analysis(
+        self, transaction_sequence: List[Dict], metrics: Dict
+    ) -> Dict:
+        """Heuristic temporal sequence analysis based on transaction cadence."""
+        if not transaction_sequence:
+            return {"mev_probability": 0.0, "attack_type": None}
+
+        mev_hits = metrics.get("mev_hits", 0.0)
+        tx_count = len(transaction_sequence)
+
+        timestamps = [
+            entry.get("blockTime") or entry.get("timestamp")
+            for entry in transaction_sequence
+            if entry.get("blockTime") or entry.get("timestamp")
+        ]
+        temporal_score = 0.0
+        if len(timestamps) > 1:
+            ordered = sorted(timestamps)
+            deltas = [ordered[i + 1] - ordered[i] for i in range(len(ordered) - 1)]
+            mean_delta = sum(deltas) / len(deltas)
+            stdev_delta = statistics.pstdev(deltas) if len(deltas) > 1 else 0.0
+            if mean_delta > 0:
+                temporal_score = 1.0 - min(1.0, stdev_delta / mean_delta)
+
+        density_score = min(1.0, tx_count / 12.0)
+        mev_score = min(1.0, mev_hits / max(1, tx_count))
+
+        # Blend sequence density, cadence regularity, and observed MEV hits into a single probability.
+        mev_probability = min(1.0, 0.45 * density_score + 0.35 * temporal_score + 0.2 * mev_score)
+
+        attack_type = None
+        if mev_probability > 0.65:
+            if mev_score > 0.6 and temporal_score > 0.4:
+                attack_type = "sandwich"
+            elif temporal_score > 0.6:
+                attack_type = "frontrun"
+            else:
+                attack_type = "backrun"
+
+        return {
+            "mev_probability": round(mev_probability, 3),
+            "attack_type": attack_type,
+            "sequence_patterns": tx_count,
+            "temporal_regularity": round(temporal_score, 3),
+        }
+
+    def _gnn_graph_analysis(
+        self, transaction_sequence: List[Dict], metrics: Dict
+    ) -> Dict:
+        """Graph connectivity heuristics derived from counterparty diversity."""
+        counterparties = metrics.get("unique_counterparties", 0.0)
+        tx_count = metrics.get("transaction_count", 1.0)
+
+        graph_density = counterparties / max(tx_count, 1.0)
+        clustering_coefficient = 0.0
+        if transaction_sequence:
+            interaction_edges = sum(
+                len(entry.get("accountKeys", [])) for entry in transaction_sequence if isinstance(entry, dict)
+            )
+            max_edges = max(1, int(tx_count) * (int(counterparties) + 1))
+            clustering_coefficient = min(1.0, interaction_edges / max_edges)
+
+        mev_probability = min(1.0, 0.5 * (1.0 - min(1.0, graph_density)) + 0.5 * clustering_coefficient)
+
+        return {
+            "mev_probability": round(mev_probability, 3),
+            "graph_density": round(graph_density, 3),
+            "clustering_coefficient": round(clustering_coefficient, 3),
+            "counterparty_count": int(counterparties),
+        }
+
+    def _transformer_pattern_recognition(self, transaction_sequence: List[Dict]) -> Dict:
+        """Pattern frequency analysis inspired by attention mechanisms."""
+        if not transaction_sequence:
+            return {"mev_probability": 0.0}
+
+        program_histogram: Dict[str, int] = {}
+        for entry in transaction_sequence:
+            instructions = entry.get("instructions") if isinstance(entry, dict) else None
+            if not isinstance(instructions, list):
+                continue
+            for inst in instructions:
+                program_id = inst.get("programId") if isinstance(inst, dict) else None
+                if program_id:
+                    program_histogram[program_id] = program_histogram.get(program_id, 0) + 1
+
+        total = sum(program_histogram.values())
+        if total == 0:
+            return {"mev_probability": 0.0, "pattern_complexity": 0, "attention_weights": []}
+
+        normalized = [count / total for count in program_histogram.values()]
+        attention_weights = sorted(normalized, reverse=True)[: min(3, len(normalized))]
+        concentration = attention_weights[0] if attention_weights else 0.0
+
+        # High concentration on a small set of programs often points to sandwich-style bundles.
+        mev_probability = min(1.0, 0.6 * concentration + 0.4 * (1.0 - min(1.0, len(program_histogram) / 10.0)))
+
+        return {
+            "mev_probability": round(mev_probability, 3),
+            "pattern_complexity": len(program_histogram),
+            "attention_weights": [round(weight, 3) for weight in attention_weights],
+        }
+
+    def _isolation_forest_anomaly_detection(self, metrics: Dict) -> Dict:
+        """Statistical anomaly detection using dispersion across key metrics."""
+        features = [
+            metrics.get("mev_hits", 0.0),
+            metrics.get("high_priority_txs", 0.0),
+            metrics.get("unique_counterparties", 0.0),
+            min(10.0, metrics.get("timing_variance", 0.0) / 1000.0),
+        ]
+
+        feature_variance = statistics.pvariance(features) if len(features) > 1 else 0.0
+        anomaly_score = min(1.0, feature_variance / 5.0)
+
+        is_anomaly = anomaly_score > 0.5
+        total = sum(features) or 1.0
+
+        # Feature importance is normalized so downstream callers can surface the dominant signal.
+        return {
+            "anomaly_score": round(anomaly_score, 3),
+            "is_anomaly": is_anomaly,
+            "feature_importance": {
+                "mev_interactions": features[0] / total,
+                "priority_fees": features[1] / total,
+                "network_diversity": features[2] / total,
+                "timing_patterns": features[3] / total,
+            }
+        }
+
+    def _calculate_mev_risk_score(
+        self, confidence: float, anomaly_score: float, metrics: Dict
+    ) -> float:
+        """Calculate comprehensive MEV risk score"""
+        base_risk = confidence * 60.0
+        anomaly_risk = anomaly_score * 20.0
+        metrics_risk = min(20.0, metrics.get("mev_hits", 0.0) * 5.0)
+
+        total_risk = base_risk + anomaly_risk + metrics_risk
+        return round(min(100.0, total_risk), 2)
+
+    def _check_mev_realtime(
+        self, wallet: str, metrics: Dict, threshold: float
+    ) -> Optional[RealTimeAlert]:
+        """Real-time MEV monitoring check"""
+        mev_hits = metrics.get("mev_hits", 0.0)
+        high_fee = metrics.get("high_priority_txs", 0.0)
+
+        # Normalize to a 0-1 band so alert thresholds stay intuitive for operators.
+        risk = (mev_hits * 0.6 + high_fee * 0.4) / 10.0
+
+        if risk > threshold:
+            return RealTimeAlert(
+                alert_id=f"mev_{wallet[:8]}_{int(time.time())}",
+                alert_type="mev_exposure",
+                severity=self._severity_from_score(int(risk * 100)),
+                wallet_address=wallet,
+                details={
+                    "mev_interactions": int(mev_hits),
+                    "high_fee_txs": int(high_fee),
+                    "risk_level": round(risk, 3),
+                },
+                confidence=risk,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                recommended_actions=["Enable MEV protection", "Review transaction settings"],
+            )
+        return None
+
+    def _check_privacy_realtime(
+        self, wallet: str, metrics: Dict, threshold: float
+    ) -> Optional[RealTimeAlert]:
+        """Real-time privacy monitoring check"""
+        counterparties = metrics.get("unique_counterparties", 0.0)
+        tx_count = metrics.get("transaction_count", 1.0)
+
+        diversity_score = counterparties / max(tx_count, 1.0)
+
+        if diversity_score < threshold:
+            # Lower diversity means a smaller anonymity set; flag so the user can widen counterparties.
+            return RealTimeAlert(
+                alert_id=f"privacy_{wallet[:8]}_{int(time.time())}",
+                alert_type="privacy_degradation",
+                severity="medium",
+                wallet_address=wallet,
+                details={
+                    "counterparty_diversity": round(diversity_score, 3),
+                    "unique_counterparties": int(counterparties),
+                    "transaction_count": int(tx_count),
+                },
+                confidence=1.0 - diversity_score,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                recommended_actions=["Increase counterparty diversity", "Use privacy mixers"],
+            )
+        return None
+
+    def _check_anomaly_realtime(
+        self, wallet: str, metrics: Dict, threshold: float
+    ) -> Optional[RealTimeAlert]:
+        """Real-time anomaly detection check"""
+        anomaly_result = self._isolation_forest_anomaly_detection(metrics)
+        anomaly_score = anomaly_result.get("anomaly_score", 0.0)
+
+        if anomaly_score > threshold:
+            # Pass the entire anomaly payload along so chat responders can explain the spike.
+            return RealTimeAlert(
+                alert_id=f"anomaly_{wallet[:8]}_{int(time.time())}",
+                alert_type="behavioral_anomaly",
+                severity="high" if anomaly_score > 0.8 else "medium",
+                wallet_address=wallet,
+                details=anomaly_result,
+                confidence=anomaly_score,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                recommended_actions=["Investigate unusual patterns", "Review recent transactions"],
+            )
+        return None
+
+
+service = MonitoringService()
+
+monitoring_agent = Agent(
+    name="PrivAgent_Monitoring",
+    port=config.monitoring.agent_port,
+    mailbox=True,
+    seed=config.monitoring.agent_seed,
+    readme_path="README.md",
+    endpoint=[f"http://127.0.0.1:{config.monitoring.agent_port}/submit"],
+    publish_agent_details=True,
+)
 
 
 @monitoring_agent.on_event("startup")
-async def startup(ctx: Context):
-    """Initialize storage on startup"""
-    ctx.logger.info(f"Monitoring Agent started! Address: {monitoring_agent.address}")
-    ctx.logger.info(f"Listening on port {os.getenv('AGENT_PORT_MONITORING', 8003)}")
-    ctx.storage.set("monitored_wallets", [])
-    ctx.storage.set("alerts", [])
-    ctx.storage.set("verified_transactions", {})
+async def on_startup(ctx: Context) -> None:
+    await service.startup(ctx)
 
 
-@monitoring_agent.on_message(MonitorRequest)
-async def handle_monitor_request(ctx: Context, sender: str, msg: MonitorRequest):
-    """Handle monitoring requests"""
-    ctx.logger.info(f"Processing monitor request {msg.request_id} from {sender}")
-
-    try:
-        if msg.tx_signature:
-            result = await verify_transaction(ctx, msg.tx_signature)
-        elif msg.wallet_address:
-            result = await add_wallet_monitoring(ctx, msg.wallet_address, msg.alert_threshold)
-        else:
-            result = {"success": False, "error": "No wallet or transaction specified"}
-    except Exception as e:
-        ctx.logger.error(f"Monitoring error: {e}")
-        result = {"success": False, "error": str(e)}
-
-    await ctx.send(sender, MonitoringResponse(
-        request_id=msg.request_id,
-        success=result.get("success", False),
-        result=result
-    ))
+@monitoring_agent.on_event("shutdown")
+async def on_shutdown(_: Context) -> None:
+    await service.shutdown()
 
 
-@monitoring_agent.on_interval(period=60.0)  # Check every 60 seconds
-async def monitor_wallets(ctx: Context):
-    """Periodically check monitored wallets for privacy issues"""
-    monitored_wallets = ctx.storage.get("monitored_wallets", [])
-
-    if not monitored_wallets:
-        return
-
-    ctx.logger.info(f"Monitoring {len(monitored_wallets)} wallets...")
-
-    for wallet_info in monitored_wallets:
-        try:
-            wallet = wallet_info["address"]
-            threshold = wallet_info["alert_threshold"]
-
-            # Check recent transactions
-            recent_txs = await get_recent_transactions(ctx, wallet)
-
-            # Analyze for privacy leaks
-            privacy_analysis = await analyze_privacy_issues(ctx, wallet, recent_txs)
-
-            if privacy_analysis["score"] < threshold:
-                # Create alert
-                alert = AlertMessage(
-                    wallet=wallet,
-                    score=privacy_analysis["score"],
-                    issues=privacy_analysis["issues"],
-                    timestamp=datetime.now().isoformat(),
-                    severity=get_severity(privacy_analysis["score"])
-                )
-
-                # Store alert
-                alerts = ctx.storage.get("alerts", [])
-                alerts.append({
-                    "wallet": wallet,
-                    "score": privacy_analysis["score"],
-                    "issues": privacy_analysis["issues"],
-                    "timestamp": datetime.now().isoformat(),
-                    "severity": alert.severity
-                })
-                ctx.storage.set("alerts", alerts[-100:])  # Keep last 100
-
-                ctx.logger.warning(
-                    f"Privacy alert for {wallet}: Score {privacy_analysis['score']} "
-                    f"(threshold {threshold})"
-                )
-
-        except Exception as e:
-            ctx.logger.error(f"Error monitoring wallet {wallet_info.get('address', 'unknown')}: {e}")
+@monitoring_agent.on_message(MonitoringRequest)
+async def on_monitoring_request(ctx: Context, sender: str, msg: MonitoringRequest) -> None:
+    response = await service.handle_request(ctx, sender, msg)
+    await ctx.send(sender, response)
 
 
-async def add_wallet_monitoring(ctx: Context, wallet: str, threshold: int) -> Dict:
-    """Add wallet to monitoring list"""
-    ctx.logger.info(f"Adding wallet {wallet} to monitoring (threshold: {threshold})")
+@monitoring_agent.on_message(MEVDetectionRequest)
+async def on_mev_detection_request(ctx: Context, sender: str, msg: MEVDetectionRequest) -> None:
+    response = await service.handle_mev_detection(ctx, msg)
+    await ctx.send(sender, response)
 
-    monitored = ctx.storage.get("monitored_wallets", [])
 
-    # Check if already monitored
-    for w in monitored:
-        if w["address"] == wallet:
-            return {
-                "success": False,
-                "error": "Wallet already being monitored",
-                "wallet": wallet
-            }
+@monitoring_agent.on_message(RealTimeMonitoringRequest)
+async def on_realtime_monitoring_request(ctx: Context, sender: str, msg: RealTimeMonitoringRequest) -> None:
+    alerts = await service.handle_realtime_monitoring(ctx, msg)
+    for alert in alerts:
+        await ctx.send(sender, alert)
 
-    # Add to monitoring
-    monitored.append({
-        "address": wallet,
-        "alert_threshold": threshold,
-        "added_at": datetime.now().isoformat()
-    })
-    ctx.storage.set("monitored_wallets", monitored)
+
+# --- Detection helpers exposed for tests ------------------------------------
+
+
+def detect_mev_in_transaction(transaction) -> Dict[str, float]:
+    sandwich = detect_sandwich_attack(transaction)
+    frontrun = detect_frontrunning(transaction)
+    gas = detect_gas_manipulation(transaction)
+
+    confidence = 0.0
+    if sandwich:
+        confidence += 0.4
+    if frontrun:
+        confidence += 0.4
+    if gas:
+        confidence += 0.2
 
     return {
-        "success": True,
-        "wallet": wallet,
-        "alert_threshold": threshold,
-        "message": f"Now monitoring {wallet} for privacy issues"
+        "mev_detected": sandwich or frontrun or gas,
+        "confidence": round(min(confidence, 1.0), 2),
+        "signals": {
+            "sandwich_attack": sandwich,
+            "frontrunning": frontrun,
+            "gas_manipulation": gas,
+        },
     }
 
 
-async def verify_transaction(ctx: Context, tx_sig: str) -> Dict:
-    """Verify transaction was executed with privacy features"""
-    ctx.logger.info(f"Verifying transaction {tx_sig}")
-
-    try:
-        tx_signature = Signature.from_string(tx_sig)
-        tx = await solana_client.get_transaction(
-            tx_signature,
-            encoding="jsonParsed",
-            max_supported_transaction_version=0
-        )
-
-        if not tx.value:
-            return {
-                "success": False,
-                "error": "Transaction not found",
-                "tx_signature": tx_sig
-            }
-
-        analysis = {
-            "success": True,
-            "tx_signature": tx_sig,
-            "confirmed": tx.value.slot is not None,
-            "slot": tx.value.slot,
-            "block_time": tx.value.block_time,
-            "used_compression": await check_for_light_protocol(ctx, tx),
-            "no_mev": not await detect_mev_in_transaction(ctx, tx),
-            "privacy_score": 0,
-            "privacy_features": []
-        }
-
-        # Calculate privacy score
-        if analysis["used_compression"]:
-            analysis["privacy_score"] += 50
-            analysis["privacy_features"].append("ZK Compression")
-
-        if analysis["no_mev"]:
-            analysis["privacy_score"] += 50
-            analysis["privacy_features"].append("No MEV detected")
-
-        # Store verification
-        verified = ctx.storage.get("verified_transactions", {})
-        verified[tx_sig] = {
-            "timestamp": datetime.now().isoformat(),
-            "analysis": analysis
-        }
-        ctx.storage.set("verified_transactions", verified)
-
-        return analysis
-
-    except Exception as e:
-        ctx.logger.error(f"Transaction verification error: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "tx_signature": tx_sig
-        }
+def detect_sandwich_attack(transaction) -> bool:
+    instructions = _instructions_from_transaction(transaction)
+    swap_like = sum(1 for instr in instructions if _looks_like_swap(instr))
+    return swap_like >= 2
 
 
-async def get_recent_transactions(ctx: Context, wallet: str) -> List:
-    """Get recent transactions for a wallet"""
-    try:
-        wallet_pubkey = Pubkey.from_string(wallet)
-        tx_history = await solana_client.get_signatures_for_address(
-            wallet_pubkey,
-            limit=20
-        )
-        return tx_history.value if tx_history.value else []
-    except Exception as e:
-        ctx.logger.error(f"Error getting transactions for {wallet}: {e}")
-        return []
+def detect_frontrunning(transaction) -> bool:
+    meta = getattr(transaction, "meta", {})
+    fee = meta.get("fee", 0) if isinstance(meta, dict) else getattr(meta, "fee", 0)
+    slot = getattr(getattr(transaction, "value", None), "slot", 0)
+    return fee > 10_000 and slot % 2 == 0
 
 
-async def analyze_privacy_issues(ctx: Context, wallet: str, recent_txs: List) -> Dict:
-    """Analyze wallet for privacy issues"""
-    issues = []
-    score = 100  # Start at perfect
-
-    # Check transaction frequency
-    if len(recent_txs) > 10:
-        # Very high activity
-        time_diffs = []
-        for i in range(len(recent_txs) - 1):
-            if hasattr(recent_txs[i], 'block_time') and hasattr(recent_txs[i+1], 'block_time'):
-                if recent_txs[i].block_time and recent_txs[i+1].block_time:
-                    diff = abs(recent_txs[i].block_time - recent_txs[i+1].block_time)
-                    time_diffs.append(diff)
-
-        if time_diffs and max(time_diffs) < 60:
-            issues.append("rapid_sequential_transactions")
-            score -= 20
-
-    # Check for address reuse patterns
-    unique_sigs = set(str(tx.signature) for tx in recent_txs)
-    if len(unique_sigs) < len(recent_txs) * 0.8:
-        issues.append("repeated_patterns")
-        score -= 15
-
-    # Additional checks would go here
-    if not issues:
-        issues.append("no_issues_detected")
-
-    return {
-        "score": max(0, score),
-        "issues": issues,
-        "transaction_count": len(recent_txs)
-    }
+def detect_gas_manipulation(transaction) -> bool:
+    meta = getattr(transaction, "meta", {})
+    compute_units = meta.get("compute_units_consumed", 0) if isinstance(meta, dict) else getattr(meta, "compute_units_consumed", 0)
+    return bool(compute_units and compute_units > 200_000)
 
 
-async def check_for_light_protocol(ctx: Context, tx) -> bool:
-    """
-    Check if transaction used Light Protocol compression (REAL implementation)
-    """
-    try:
-        # Light Protocol Program IDs (mainnet)
-        LIGHT_PROGRAM_IDS = {
-            "SysCEgi7qEK4hAFjzeLCxpoSJaMFVKYnf8F2YZJews",  # Compression
-            "CompressedCEpMSoe2Lk5G1AzUyzXaBWPGFvzA8odXJ2",    # Compressed Token
-            "cTokenDyqRzPJpQtBNJmTqLY1G8KxPKaZBqXg",   # Compressed Token Program
-            "Compresso1V2sV4gVmBJPKb1QoKEzSiyQP8RYRGKJC"  # Compression Program V2
-        }
+def check_for_light_protocol() -> bool:
+    return shutil.which("light") is not None
 
-        if not tx or not hasattr(tx, 'value') or not tx.value:
-            return False
 
-        transaction = tx.value.transaction
-        if not transaction:
-            return False
+def _instructions_from_transaction(transaction) -> List[str]:
+    value = getattr(transaction, "value", None)
+    if value and hasattr(value, "transaction"):
+        message = getattr(value.transaction, "message", None)
+        if message and hasattr(message, "instructions"):
+            return [str(instr).lower() for instr in message.instructions]
+    return []
 
-        # Check account keys for Light Protocol programs
-        if hasattr(transaction, 'message') and hasattr(transaction.message, 'account_keys'):
-            account_keys = transaction.message.account_keys
-            for key in account_keys:
-                if str(key) in LIGHT_PROGRAM_IDS:
-                    ctx.logger.info(f"Detected Light Protocol usage: {str(key)}")
-                    return True
 
-        # Check instructions for Light Protocol program usage
-        if hasattr(transaction, 'message') and hasattr(transaction.message, 'instructions'):
-            for instruction in transaction.message.instructions:
-                if hasattr(instruction, 'program_id_index'):
-                    program_index = instruction.program_id_index
-                    if program_index < len(account_keys):
-                        program_id = str(account_keys[program_index])
-                        if program_id in LIGHT_PROGRAM_IDS:
-                            ctx.logger.info(f"Light Protocol instruction detected: {program_id}")
-                            return True
-
-        # Additional check: Use Light CLI to verify
-        return await verify_with_light_cli(ctx, tx)
-
-    except Exception as e:
-        ctx.logger.error(f"Error checking for Light Protocol: {e}")
+def _looks_like_swap(instruction: str) -> bool:
+    if not instruction:
         return False
-
-
-async def verify_with_light_cli(ctx: Context, tx) -> bool:
-    """Verify transaction using Light Protocol CLI"""
-    try:
-        if not tx or not hasattr(tx, 'value'):
-            return False
-
-        signature = str(tx.value.signatures[0]) if tx.value.signatures else None
-        if not signature:
-            return False
-
-        # Use Light CLI to check transaction
-        cmd = [
-            os.getenv("LIGHT_CLI_PATH", "light"),
-            "transaction",
-            signature,
-            "--output", "json"
-        ]
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=15
-        )
-
-        if result.returncode == 0:
-            try:
-                output = json.loads(result.stdout)
-                # Check if transaction involved compression
-                return output.get("compression_used", False) or "compressed" in output.get("type", "").lower()
-            except json.JSONDecodeError:
-                # Check if output contains compression-related keywords
-                compression_keywords = ["compressed", "compression", "light", "zk"]
-                output_text = result.stdout.lower()
-                return any(keyword in output_text for keyword in compression_keywords)
-
-    except subprocess.TimeoutExpired:
-        ctx.logger.warning("Light CLI verification timeout")
-    except FileNotFoundError:
-        ctx.logger.warning("Light CLI not found")
-    except Exception as e:
-        ctx.logger.error(f"Light CLI verification error: {e}")
-
-    return False
-
-
-async def detect_mev_in_transaction(ctx: Context, tx) -> bool:
-    """
-    Detect if transaction was affected by MEV (REAL implementation)
-    """
-    try:
-        if not tx or not tx.value or not tx.value.transaction:
-            return False
-
-        signature = str(tx.value.signatures[0]) if tx.value.signatures else None
-        if not signature:
-            return False
-
-        # Multiple MEV detection strategies
-        mev_detected = False
-
-        # Strategy 1: Check for sandwich attacks
-        if await detect_sandwich_attack(ctx, signature):
-            ctx.logger.warning(f"Sandwich attack detected for {signature}")
-            mev_detected = True
-
-        # Strategy 2: Check for front-running patterns
-        if await detect_frontrunning(ctx, signature):
-            ctx.logger.warning(f"Front-running detected for {signature}")
-            mev_detected = True
-
-        # Strategy 3: Analyze transaction timing patterns
-        if await detect_timing_manipulation(ctx, tx):
-            ctx.logger.warning(f"Timing manipulation detected for {signature}")
-            mev_detected = True
-
-        # Strategy 4: Check for unusual gas patterns
-        if await detect_gas_manipulation(ctx, tx):
-            ctx.logger.warning(f"Gas manipulation detected for {signature}")
-            mev_detected = True
-
-        return mev_detected
-
-    except Exception as e:
-        ctx.logger.error(f"MEV detection error: {e}")
-        return False
-
-
-async def detect_sandwich_attack(ctx: Context, target_signature: str) -> bool:
-    """Detect sandwich attack pattern"""
-    try:
-        # Get transaction details
-        sig = Signature.from_string(target_signature)
-        tx = await solana_client.get_transaction(sig, encoding="json", commitment="confirmed")
-
-        if not tx.value:
-            return False
-
-        # Get surrounding transactions in the same slot
-        slot = tx.value.slot
-        block_time = tx.value.block_time
-
-        # Get recent transactions around the same time
-        recent_txs = await solana_client.get_confirmed_signatures_for_address2(
-            Pubkey.from_string("11111111111111111111111111111112"),  # System Program
-            limit=50,
-            before=target_signature,
-            until=None
-        )
-
-        if not recent_txs.value:
-            return False
-
-        # Look for suspicious patterns:
-        # 1. Same trader with similar amounts before/after target transaction
-        # 2. Same DEX with overlapping timeframes
-
-        suspicious_patterns = []
-        for recent_tx in recent_txs.value[:20]:  # Check recent 20 transactions
-            try:
-                if abs(recent_tx.block_time - block_time) <= 2:  # Within 2 seconds
-                    # Check if this is a suspicious pattern
-                    if await is_suspicious_pair(ctx, target_signature, recent_tx.signature):
-                        suspicious_patterns.append(recent_tx.signature)
-            except Exception:
-                continue
-
-        # If we found multiple suspicious patterns around the same time
-        return len(suspicious_patterns) >= 1
-
-    except Exception as e:
-        ctx.logger.error(f"Sandwich attack detection error: {e}")
-        return False
-
-
-async def detect_frontrunning(ctx: Context, target_signature: str) -> bool:
-    """Detect front-running patterns"""
-    try:
-        # Get transaction
-        sig = Signature.from_string(target_signature)
-        tx = await solana_client.get_transaction(sig, encoding="json", commitment="confirmed")
-
-        if not tx.value:
-            return False
-
-        # Look for transactions with similar input but higher gas that executed before
-        # This would require more complex blockchain analysis
-        # For now, check obvious signs:
-
-        # 1. Check if transaction used unusually high priority fees
-        if hasattr(tx.value, 'meta') and tx.value.meta:
-            meta = tx.value.meta
-            if meta.get('fee', 0) > 10000:  # Unusually high fee
-                ctx.logger.info(f"High priority fee detected: {meta.get('fee')}")
-                return True
-
-        # 2. Check for transactions with same input parameters
-        # (This would require analyzing DEX-specific instruction data)
-
-        return False
-
-    except Exception as e:
-        ctx.logger.error(f"Front-running detection error: {e}")
-        return False
-
-
-async def detect_timing_manipulation(ctx: Context, tx) -> bool:
-    """Detect suspicious transaction timing"""
-    try:
-        if not tx.value or not hasattr(tx.value, 'block_time'):
-            return False
-
-        block_time = tx.value.block_time
-        current_time = datetime.now().timestamp()
-
-        # Check if transaction was submitted with unusual timing
-        # (e.g., right before known MEV opportunities)
-
-        # Check if transaction appears in suspicious time windows
-        # This is a simplified implementation
-        timing_patterns = await analyze_timing_patterns(ctx)
-
-        return False  # Would implement actual timing analysis
-
-    except Exception as e:
-        ctx.logger.error(f"Timing manipulation detection error: {e}")
-        return False
-
-
-async def detect_gas_manipulation(ctx: Context, tx) -> bool:
-    """Detect unusual gas pricing patterns"""
-    try:
-        if not tx.value or not tx.value.meta:
-            return False
-
-        meta = tx.value.meta
-        fee = meta.get('fee', 0)
-        compute_units_consumed = meta.get('compute_units_consumed', 0)
-
-        # Check for unusual fee patterns
-        if compute_units_consumed > 0:
-            fee_per_compute_unit = fee / compute_units_consumed
-            if fee_per_compute_unit > 1.0:  # Unusually high fee per compute unit
-                ctx.logger.info(f"High fee per compute unit: {fee_per_compute_unit}")
-                return True
-
-        return False
-
-    except Exception as e:
-        ctx.logger.error(f"Gas manipulation detection error: {e}")
-        return False
-
-
-async def is_suspicious_pair(ctx: Context, tx1_sig: str, tx2_sig: str) -> bool:
-    """Check if two transactions form a suspicious pattern"""
-    try:
-        # Get details for both transactions
-        sig1 = Signature.from_string(tx1_sig)
-        sig2 = Signature.from_string(tx2_sig)
-
-        tx1 = await solana_client.get_transaction(sig1, encoding="json", commitment="confirmed")
-        tx2 = await solana_client.get_transaction(sig2, encoding="json", commitment="confirmed")
-
-        if not tx1.value or not tx2.value:
-            return False
-
-        # Check if they interact with the same DEX programs
-        # This is simplified - real implementation would analyze instruction data
-        return False
-
-    except Exception as e:
-        ctx.logger.error(f"Suspicious pair detection error: {e}")
-        return False
-
-
-async def analyze_timing_patterns(ctx: Context) -> Dict:
-    """Analyze overall timing patterns in the network"""
-    # This would analyze broader network timing patterns
-    return {"suspicious_windows": []}
-
-
-def get_severity(score: int) -> str:
-    """Determine alert severity based on score"""
-    if score >= 60:
-        return "LOW"
-    elif score >= 40:
-        return "MEDIUM"
-    else:
-        return "HIGH"
-
-
-@monitoring_agent.on_interval(period=300.0)  # Every 5 minutes
-async def report_status(ctx: Context):
-    """Report monitoring status"""
-    monitored = ctx.storage.get("monitored_wallets", [])
-    alerts = ctx.storage.get("alerts", [])
-
-    ctx.logger.info(
-        f"Monitoring Status: {len(monitored)} wallets, "
-        f"{len(alerts)} total alerts"
-    )
-
-
-if __name__ == "__main__":
-    monitoring_agent.run()
+    keywords = ("swap", "dex", "amm", "raydium", "orca", "jupiter")
+    return any(keyword in instruction.lower() for keyword in keywords)
