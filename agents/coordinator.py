@@ -127,9 +127,6 @@ class CoordinatorService:
         self._llm_max_tokens = self.config.llm.max_tokens  # Response length limit
         self._llm_timeout = self.config.llm.timeout_seconds  # Prevent hanging
 
-        # Dynamic agent discovery cache (reduces network queries to almanac)
-        self._discovery_cache = {}
-        self._cache_ttl = 300  # Cache discovered agents for 5 minutes
 
     async def startup(self, ctx: Context) -> None:
         ctx.storage.set("sessions", {})
@@ -138,10 +135,23 @@ class CoordinatorService:
 
         # Log discovery mode
         if self.privacy_agent and self.execution_agent and self.monitoring_agent:
-            ctx.logger.info("coordinator ready - using hardcoded agent addresses")
+            ctx.logger.info("coordinator ready - using configured agent addresses")
+            ctx.logger.info(f"Privacy Agent: {self.privacy_agent}")
+            ctx.logger.info(f"Execution Agent: {self.execution_agent}")
+            ctx.logger.info(f"Monitoring Agent: {self.monitoring_agent}")
         else:
-            ctx.logger.info("coordinator ready - will use dynamic discovery for missing agents")
-            await self._discover_agents(ctx)
+            # List missing agents
+            missing = []
+            if not self.privacy_agent:
+                missing.append("PRIVACY_AGENT_ADDRESS")
+            if not self.execution_agent:
+                missing.append("EXECUTION_AGENT_ADDRESS")
+            if not self.monitoring_agent:
+                missing.append("MONITORING_AGENT_ADDRESS")
+
+            ctx.logger.error(f"❌ Missing required agent addresses in .env: {', '.join(missing)}")
+            ctx.logger.error("❌ Please deploy agents to Agentverse and set their addresses in .env")
+            ctx.logger.error("❌ Or run all agents locally for testing (see DEPLOYMENT.md)")
 
     async def handle_chat_message(self, ctx: Context, sender: str, message: ChatMessage) -> None:
         await self._acknowledge(ctx, sender, message)
@@ -867,86 +877,9 @@ class CoordinatorService:
             lines.extend(f"- {item}" for item in issues)
         return "\n".join(lines)
 
-    # =========================================================================
-    # Dynamic Discovery Methods (Agentverse Backup)
-    # =========================================================================
-
-    async def _discover_agents(self, ctx: Context) -> None:
-        """Discover missing agents from Agentverse as backup."""
-        # We only hit the Agentverse API when an address is absent or the cache has expired.
-        if not self.privacy_agent:
-            self.privacy_agent = await self._search_agent(ctx, "privacy", "privacy analysis")
-            if self.privacy_agent:
-                ctx.logger.info(f"🔍 Discovered privacy agent: {self.privacy_agent}")
-
-        if not self.execution_agent:
-            self.execution_agent = await self._search_agent(ctx, "execution", "swap transfer")
-            if self.execution_agent:
-                ctx.logger.info(f"🔍 Discovered execution agent: {self.execution_agent}")
-
-        if not self.monitoring_agent:
-            self.monitoring_agent = await self._search_agent(ctx, "monitoring", "mev detection")
-            if self.monitoring_agent:
-                ctx.logger.info(f"🔍 Discovered monitoring agent: {self.monitoring_agent}")
-
-    async def _search_agent(self, ctx: Context, agent_type: str, search_terms: str) -> Optional[str]:
-        """Search for agents on Agentverse."""
-        # Check cache first
-        cache_key = f"search_{agent_type}"
-        if cache_key in self._discovery_cache:
-            cached = self._discovery_cache[cache_key]
-            if (datetime.now().timestamp() - cached["timestamp"]) < self._cache_ttl:
-                return cached["address"]
-
-        try:
-            # Search Agentverse
-            url = "https://agentverse.ai/v1/search/agents"
-            headers = {"Content-Type": "application/json"}
-
-            # Use the chat protocol digest for filtering
-            data = {
-                "search_text": search_terms,
-                "sort": "relevancy",
-                "filters": {
-                    "protocol_digest": [chat_protocol_spec.digest]
-                },
-                "direction": "asc",
-                "offset": 0,
-                "limit": 5
-            }
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(url, json=data, headers=headers)
-                if response.status_code == 200:
-                    agents_data = response.json()
-                    agents = agents_data.get("agents", [])
-
-                    if agents:
-                        # Pick the most relevant agent
-                        best_agent = agents[0]
-                        address = best_agent.get("address")
-
-                        # Cache the result
-                        self._discovery_cache[cache_key] = {
-                            "address": address,
-                            "timestamp": datetime.now().timestamp()
-                        }
-
-                        ctx.logger.info(f"✅ Found {agent_type} agent: {best_agent.get('name', 'Unknown')}")
-                        return address
-                    else:
-                        ctx.logger.warning(f"❌ No {agent_type} agents found on Agentverse")
-                        return None
-                else:
-                    ctx.logger.error(f"❌ Agentverse search failed: {response.status_code}")
-                    return None
-
-        except Exception as e:
-            ctx.logger.error(f"❌ Error searching for {agent_type} agent: {e}")
-            return None
 
     async def _get_agent_address(self, ctx: Context, agent_type: str) -> Optional[str]:
-        """Get agent address with dynamic discovery fallback."""
+        """Get agent address - NO dynamic discovery to prevent wrong agent connections."""
         address_map = {
             "privacy": self.privacy_agent,
             "execution": self.execution_agent,
@@ -955,16 +888,11 @@ class CoordinatorService:
 
         address = address_map.get(agent_type)
 
-        if not address:
-            # Try to discover it
-            ctx.logger.info(f"🔍 Attempting to discover {agent_type} agent...")
-            await self._discover_agents(ctx)
-            address = address_map.get(agent_type)
-
         if address:
             ctx.logger.info(f"✅ Using {agent_type} agent: {address}")
         else:
-            ctx.logger.warning(f"❌ {agent_type} agent not available")
+            ctx.logger.error(f"❌ {agent_type} agent not configured in .env")
+            ctx.logger.error(f"❌ Set {agent_type.upper()}_AGENT_ADDRESS in .env file")
 
         return address
 

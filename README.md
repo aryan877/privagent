@@ -82,6 +82,207 @@ uv run python privacy_demo.py
 
 ---
 
+## 🚀 Deployment
+
+### Prerequisites
+
+Before deploying, ensure you have:
+- Python 3.12+ installed
+- Node.js (for Light Protocol CLI)
+- A Helius API account (free tier available at https://www.helius.dev/)
+- OpenAI API key or ASI:One API key for LLM routing
+
+### Step 1: Environment Setup
+
+Create and configure your environment file:
+
+```bash
+# Copy the environment template
+cp .env-example .env
+
+# Edit with your credentials
+vi .env
+```
+
+**Required Environment Variables:**
+
+```bash
+# LLM Provider (for coordinator routing)
+LLM_PROVIDER=openai
+LLM_API_KEY=your-openai-api-key-here
+LLM_MODEL=gpt-4o-mini
+
+# Blockchain RPC
+BLOCKCHAIN_HELIUS_RPC_URL=https://your-helius-rpc-url.mainnet.helius-rpc.com
+BLOCKCHAIN_SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+
+# Execution Wallet
+PAYER_KEYPAIR_PATH=./keys/payer-keypair.json
+
+# Agent Seeds (use unique secure values)
+COORDINATOR_SEED=your-secure-coordinator-seed-phrase-here
+PRIVACY_AGENT_SEED=your-secure-privacy-agent-seed-phrase-here
+EXECUTION_AGENT_SEED=your-secure-execution-agent-seed-phrase-here
+MONITORING_AGENT_SEED=your-secure-monitoring-agent-seed-phrase-here
+```
+
+**Getting API Keys:**
+
+- **OpenAI**: Visit [platform.openai.com/api-keys](https://platform.openai.com/api-keys) to create an API key
+- **ASI:One** (Alternative): Visit [asi1.ai](https://asi1.ai), sign up, navigate to profile → "API Keys"
+- **Helius RPC**: Sign up at [helius.dev](https://www.helius.dev/) for free RPC access
+
+### Step 2: Install Dependencies
+
+```bash
+# Install uv package manager
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+# Install Light Protocol CLI
+npm install -g @lightprotocol/zk-compression-cli
+
+# Sync Python dependencies
+cd agent/
+uv sync
+
+# Verify installations
+uv --version
+light --version
+python --version  # Should be 3.12+
+```
+
+### Step 3: Local Testing
+
+Test your setup locally before deploying:
+
+```bash
+# Run authentication tests
+uv run python tests/test_authentication.py
+
+# Start coordinator agent
+uv run python run_coordinator.py
+```
+
+**Expected Output:**
+```
+============================================================
+PrivAgent Coordinator - Starting...
+============================================================
+
+Agent Address: agent1qf...
+Port: 8000
+
+To test via ASI:One:
+1. Go to https://asi1.ai
+2. Search for agent: agent1qf...
+3. Send message: 'hello' or 'help'
+============================================================
+```
+
+### Step 4: Deploy to Agentverse
+
+**⚠️ Important Limitation:** Agentverse does not support the Light Protocol CLI (requires npm installation). When deploying to Agentverse, ZK compression features will use simulated mode. For full Light Protocol functionality, run agents locally.
+
+To deploy to production on Agentverse, you need to deploy all 4 agents:
+
+#### 4.1 Deploy Privacy Agent
+
+1. Go to [agentverse.ai](https://agentverse.ai/) and log in
+2. Click "My Agents" → "New Agent" → "Blank Agent"
+3. Name: `PrivAgent Privacy`
+4. Copy content from `agents/privacy_agent.py` and paste
+5. Add environment variables in "Secrets" tab:
+   ```bash
+   BLOCKCHAIN_HELIUS_RPC_URL=your-helius-rpc-url
+   PRIVACY_AGENT_SEED=your-secure-seed
+   CLI_FALLBACK_TO_API=true  # Required for Agentverse (no CLI available)
+   ```
+6. Click "Start" and copy the agent address (starts with `agent1...`)
+
+#### 4.2 Deploy Execution Agent
+
+1. Create new agent: `PrivAgent Execution`
+2. Copy content from `agents/execution_agent.py`
+3. Add environment variables including `PAYER_KEYPAIR_PATH`
+4. Start and copy agent address
+
+#### 4.3 Deploy Monitoring Agent
+
+1. Create new agent: `PrivAgent Monitoring`
+2. Copy content from `agents/monitoring_agent.py`
+3. Add environment variables
+4. Start and copy agent address
+
+#### 4.4 Deploy Coordinator Agent
+
+1. Create new agent: `PrivAgent Coordinator`
+2. Copy content from `agents/coordinator.py`
+3. Add environment variables including addresses from previous steps:
+   ```bash
+   PRIVACY_AGENT_ADDRESS=agent1q... (from step 4.1)
+   EXECUTION_AGENT_ADDRESS=agent1q... (from step 4.2)
+   MONITORING_AGENT_ADDRESS=agent1q... (from step 4.3)
+   ```
+4. Start and copy the coordinator agent address (main entry point)
+
+### Step 5: Test on ASI:One
+
+1. Visit [asi1.ai](https://asi1.ai/) or [agentverse.ai/chat](https://agentverse.ai/chat)
+2. Search for your coordinator agent address or "PrivAgent Coordinator"
+3. Test with commands:
+   ```
+   "hello"
+   "help"
+   "check privacy score for wallet Gx7UJ7XNBFxRDehVQhZtKRhYHA1J1pkmvxAMUeF4CX"
+   ```
+4. Verify:
+   - Agent responds to messages
+   - Responses are formatted correctly
+   - Session persists across messages
+
+### Recommended: Local Multi-Agent Deployment
+
+**For full Light Protocol CLI support**, run all agents locally on your machine:
+
+```bash
+# Terminal 1: Privacy Agent
+uv run python agents/privacy_agent.py
+
+# Terminal 2: Execution Agent
+uv run python agents/execution_agent.py
+
+# Terminal 3: Monitoring Agent
+uv run python agents/monitoring_agent.py
+
+# Terminal 4: Coordinator
+uv run python run_coordinator.py
+```
+
+All agents will run locally with full ZK compression capabilities via Light Protocol CLI.
+
+### Troubleshooting
+
+**Agent Won't Start:**
+```bash
+# Check Python version
+python --version  # Must be 3.12+
+
+# Reinstall dependencies
+uv sync
+
+# Check .env file exists and is configured
+cat .env | grep -v "^#" | grep -v "^$"
+```
+
+**ASI:One Can't Find Agent:**
+1. Verify agent is "Active" on [agentverse.ai/agents](https://agentverse.ai/agents)
+2. Check "Chat Protocol" badge is visible
+3. Verify `publish_manifest=True` in coordinator.py
+4. Wait 5-10 minutes for discovery propagation
+
+---
+
 ## 🔧 Configuration Guide
 
 | Category | Key Variables | Notes |

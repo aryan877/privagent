@@ -24,6 +24,11 @@ wallet.json
 private_keys.json
 secrets.json
 
+# Keys directory (Solana keypairs and secrets)
+keys/
+keys/*
+!keys/README.md
+
 # IDE files
 .vscode/
 .idea/
@@ -44,3 +49,10 @@ htmlcov/
 
 # uv
 .uv_cache/
+
+# Claude Code configuration
+.claude/
+
+# Personal deployment notes
+DEPLOYMENT.md
+HACKATHON_DEMO_SCRIPT.md
