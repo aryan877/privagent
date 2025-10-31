@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
 import re
 import textwrap
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 from uuid import uuid4
 
@@ -216,7 +217,7 @@ class CoordinatorService:
             ctx.logger.warning(f"Privacy alert from unauthorized agent: {sender}")
             return
 
-        alerts = ctx.storage.get("alerts", [])
+        alerts = ctx.storage.get("alerts") or []
         alerts.append(msg.dict())
         ctx.storage.set("alerts", alerts)
         ctx.logger.info(
@@ -228,18 +229,18 @@ class CoordinatorService:
 
     async def _acknowledge(self, ctx: Context, sender: str, message: ChatMessage) -> None:
         acknowledgement = ChatAcknowledgement(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             acknowledged_msg_id=message.msg_id,
         )
         await ctx.send(sender, acknowledgement)
 
     async def _open_session(self, ctx: Context, session_id: str, sender: str) -> None:
-        sessions = ctx.storage.get("sessions", {})
-        sessions[str(session_id)] = {"sender": sender, "opened": datetime.utcnow().isoformat()}
+        sessions = ctx.storage.get("sessions") or {}
+        sessions[str(session_id)] = {"sender": sender, "opened": datetime.now(timezone.utc).isoformat()}
         ctx.storage.set("sessions", sessions)
 
     async def _close_session(self, ctx: Context, session_id: str) -> None:
-        sessions = ctx.storage.get("sessions", {})
+        sessions = ctx.storage.get("sessions") or {}
         sessions.pop(str(session_id), None)
         ctx.storage.set("sessions", sessions)
 
@@ -514,8 +515,27 @@ class CoordinatorService:
             wallet_address=wallet_address,
             request_id=request_id,
         )
-        await ctx.send(privacy_agent, request)
-        self._store_pending(ctx, request_id, sender, "privacy")
+
+        # Implement retry logic for mailbox communication
+        max_retries = 3
+        retry_delay = 2  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                ctx.logger.info(f"Attempt {attempt + 1}/{max_retries}: Sending privacy report request to mailbox agent {privacy_agent}")
+                await ctx.send(privacy_agent, request)
+                self._store_pending(ctx, request_id, sender, "privacy")
+                ctx.logger.info(f"✅ Privacy report request sent successfully via mailbox, request_id: {request_id}")
+                break
+            except Exception as e:
+                ctx.logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    ctx.logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    ctx.logger.error(f"All {max_retries} attempts failed. Last error: {e}")
+                    return f"❌ Mailbox communication failed after {max_retries} attempts. The agents may still be initializing. Please try again in a moment."
 
         return (
             f"Privacy report request submitted for wallet {wallet_address[:8]}... "
@@ -714,7 +734,7 @@ class CoordinatorService:
 
     async def _send_text(self, ctx: Context, recipient: str, text: str) -> None:
         message = ChatMessage(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             msg_id=uuid4(),
             content=[TextContent(type="text", text=text)],
         )
@@ -745,10 +765,10 @@ class CoordinatorService:
         ctx.storage.set("pending", pending)
 
     def _pending(self, ctx: Context) -> Dict[str, Dict[str, str]]:
-        return ctx.storage.get("pending", {})
+        return ctx.storage.get("pending") or {}
 
     def _remove_pending(self, ctx: Context, request_id: str) -> None:
-        pending = ctx.storage.get("pending", {})
+        pending = ctx.storage.get("pending") or {}
         pending.pop(request_id, None)
         ctx.storage.set("pending", pending)
 
@@ -968,14 +988,6 @@ async def on_chat_ack(ctx: Context, sender: str, message: ChatAcknowledgement) -
     ctx.logger.debug("message %s acknowledged by %s", message.acknowledged_msg_id, sender)
 
 
-# Include the chat protocol to enable ASI:One compatibility
-coordinator.include(protocol, publish_manifest=True)
-
-
-if __name__ == "__main__":
-    coordinator.run()
-
-
 @coordinator.on_message(PrivacyResponse)
 async def on_privacy_response(ctx: Context, sender: str, message: PrivacyResponse) -> None:
     await service.receive_privacy_response(ctx, sender, message)
@@ -996,4 +1008,9 @@ async def on_privacy_alert(ctx: Context, sender: str, message: PrivacyAlert) -> 
     await service.receive_privacy_alert(ctx, sender, message)
 
 
-coordinator.include(protocol)
+# Include the chat protocol to enable ASI:One compatibility
+coordinator.include(protocol, publish_manifest=True)
+
+
+if __name__ == "__main__":
+    coordinator.run()

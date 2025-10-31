@@ -121,7 +121,7 @@ class MonitoringService:
                 result={"error": "monitoring rate limit reached"},
             )
 
-        ctx.storage.set("monitoring_requests", (ctx.storage.get("monitoring_requests", 0) or 0) + 1)
+        ctx.storage.set("monitoring_requests", (ctx.storage.get("monitoring_requests") or 0) + 1)
         try:
             assessment = await self._assess_wallet(ctx, request.wallet_address)
         except Exception as exc:  # noqa: PERF203

@@ -154,7 +154,7 @@ class PrivacyService:
 
     async def handle_request(self, ctx: Context, request: PrivacyRequest) -> PrivacyResponse:
         started = time.perf_counter()
-        ctx.storage.set("privacy_requests", (ctx.storage.get("privacy_requests", 0) or 0) + 1)
+        ctx.storage.set("privacy_requests", (ctx.storage.get("privacy_requests") or 0) + 1)
 
         try:
             if request.action == "compress":
@@ -198,7 +198,7 @@ class PrivacyService:
             return {"success": False, "result": {"error": str(exc)}}
 
         self.cli_breaker.record_success()
-        ctx.storage.set("compression_jobs", (ctx.storage.get("compression_jobs", 0) or 0) + 1)
+        ctx.storage.set("compression_jobs", (ctx.storage.get("compression_jobs") or 0) + 1)
 
         if outcome.success:
             return {
@@ -300,7 +300,14 @@ class PrivacyService:
         return CompressionResult(success=True, signature=signature, explorer_url=explorer)
 
     async def _derive_wallet_metrics(self, ctx: Context, wallet: str) -> Dict[str, float]:
-        pubkey = Pubkey.from_string(wallet)
+        # Strip whitespace and validate
+        wallet = wallet.strip()
+        ctx.logger.info(f"Analyzing wallet: '{wallet}' (length={len(wallet)})")
+
+        try:
+            pubkey = Pubkey.from_string(wallet)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid Solana address '{wallet}' (length={len(wallet)}): {exc}") from exc
         try:
             signatures = await self.rpc_client.get_signatures_for_address(pubkey, limit=16)
         except Exception as exc:  # noqa: PERF203
@@ -308,7 +315,15 @@ class PrivacyService:
 
         records = signatures.value or []
         if not records:
-            raise RuntimeError(f"no recent transactions found for wallet {wallet}")
+            ctx.logger.warning(f"No recent transactions found for wallet {wallet}")
+            # Return default metrics for wallets with no transactions
+            return {
+                "compression_ratio": 0.0,
+                "unique_counterparties": 0,
+                "reuse_ratio": 0.0,
+                "timing_variance": 0.0,
+                "transaction_count": 0,
+            }
 
         timestamps = [r.block_time for r in records if r.block_time]
         transaction_count = len(records)
