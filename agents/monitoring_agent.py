@@ -650,11 +650,9 @@ service = MonitoringService()
 
 monitoring_agent = Agent(
     name="PrivAgent_Monitoring",
-    port=config.monitoring.agent_port,
-    mailbox=True,
     seed=config.monitoring.agent_seed,
+    mailbox=True,
     readme_path="README.md",
-    endpoint=[f"http://127.0.0.1:{config.monitoring.agent_port}/submit"],
     publish_agent_details=True,
 )
 

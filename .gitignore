@@ -53,6 +53,8 @@ htmlcov/
 # Claude Code configuration
 .claude/
 
-# Personal deployment notes
-DEPLOYMENT.md
-HACKATHON_DEMO_SCRIPT.md
+# Strategy and deployment files (excluding README)
+!README.md
+*DEPLOYMENT*.md
+*HACKATHON*.md
+*AGENTVERSE*.md

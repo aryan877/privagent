@@ -13,273 +13,127 @@ Privacy-preserving AI agents that enable confidential transactions, MEV protecti
 
 ---
 
-## ⚡ Quick Start (5 Minutes)
+## ⚡ Quick Start (2 Minutes)
 
-### 1. Install Prerequisites
-
-```bash
-# Install uv (Python package manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install Light Protocol CLI (for ZK compression)
-npm install -g @lightprotocol/zk-compression-cli
-
-# Acquire a Helius API key (https://www.helius.dev/)
-
-# Verify installations
-uv --version
-light --version
-```
-
-### 2. Configure Environment
-
-```bash
-cp .env.example .env
-vi .env  # set RPC URLs, agent seeds, wallet credentials
-```
-
-Essential variables:
-- `BLOCKCHAIN_HELIUS_RPC_URL` – primary RPC endpoint (Helius recommended)
-- `PAYER_PRIVATE_KEY` **or** `PAYER_KEYPAIR_PATH` – execution wallet (JSON array or file)
-- `EXECUTION_JUPITER_API_KEY` – optional Jupiter Pro key (public tier if blank)
-- `LIGHT_CLI_PATH` – absolute path to the Light Protocol CLI when not on `$PATH`
-
-### 3. Install & Run
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-uv sync
-
-# Run the full bureau (coordinator + specialists)
-./run_all_agents.sh
-
-# or start agents individually
-uv run python run_coordinator.py
-uv run python agents/privacy_agent.py
-uv run python agents/execution_agent.py
-uv run python agents/monitoring_agent.py
-```
-
-### 4. Test via ASI:One
-1. Copy the coordinator address printed at startup.
-2. Visit https://asi1.ai and search for the address.
-3. Say "hello" or ask for `help`.
-
-### 5. 🎬 Impressive Demo Mode (For Hackathon)
-```bash
-# Quick demo preparation
-./demo_quick.sh
-
-# Run guided demo (highlights all winning features)
-uv run python privacy_demo.py
-
-# Test key capabilities:
-"check privacy score for wallet Gx7UJ7XNBFxRDehVQhZtKRhYHA1J1pkmvxAMUeF4CX"
-"compress 1000 USDC from wallet Gx7UJ7XNBFxRDehVQhZtKRhYHA1J1pkmvxAMUeF4CX"
-"protect my swap from MEV"
-"monitor my wallet for privacy issues"
-```
-
----
-
-## 🚀 Deployment
-
-### Prerequisites
-
-Before deploying, ensure you have:
-- Python 3.12+ installed
-- Node.js (for Light Protocol CLI)
-- A Helius API account (free tier available at https://www.helius.dev/)
-- OpenAI API key or ASI:One API key for LLM routing
-
-### Step 1: Environment Setup
-
-Create and configure your environment file:
+### 1. Environment Setup
 
 ```bash
 # Copy the environment template
-cp .env-example .env
+cp .env.example .env
 
 # Edit with your credentials
 vi .env
 ```
 
 **Required Environment Variables:**
+- `LLM_API_KEY` – OpenAI or ASI:One API key
+- `COORDINATOR_SEED` – secure seed phrase for coordinator
+- `PRIVACY_AGENT_SEED` – secure seed phrase for privacy agent
+- `EXECUTION_AGENT_SEED` – secure seed phrase for execution agent
+- `MONITORING_AGENT_SEED` – secure seed phrase for monitoring agent
+- `BLOCKCHAIN_HELIUS_RPC_URL` – Helius RPC URL
+
+### 2. Run All Agents
 
 ```bash
-# LLM Provider (for coordinator routing)
-LLM_PROVIDER=openai
-LLM_API_KEY=your-openai-api-key-here
-LLM_MODEL=gpt-4o-mini
-
-# Blockchain RPC
-BLOCKCHAIN_HELIUS_RPC_URL=https://your-helius-rpc-url.mainnet.helius-rpc.com
-BLOCKCHAIN_SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-
-# Execution Wallet
-PAYER_KEYPAIR_PATH=./keys/payer-keypair.json
-
-# Agent Seeds (use unique secure values)
-COORDINATOR_SEED=your-secure-coordinator-seed-phrase-here
-PRIVACY_AGENT_SEED=your-secure-privacy-agent-seed-phrase-here
-EXECUTION_AGENT_SEED=your-secure-execution-agent-seed-phrase-here
-MONITORING_AGENT_SEED=your-secure-monitoring-agent-seed-phrase-here
+# Start all 4 agents with one command
+./run_all_agents.sh
 ```
 
-**Getting API Keys:**
-
-- **OpenAI**: Visit [platform.openai.com/api-keys](https://platform.openai.com/api-keys) to create an API key
-- **ASI:One** (Alternative): Visit [asi1.ai](https://asi1.ai), sign up, navigate to profile → "API Keys"
-- **Helius RPC**: Sign up at [helius.dev](https://www.helius.dev/) for free RPC access
-
-### Step 2: Install Dependencies
-
-```bash
-# Install uv package manager
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-# Install Light Protocol CLI
-npm install -g @lightprotocol/zk-compression-cli
-
-# Sync Python dependencies
-cd agent/
-uv sync
-
-# Verify installations
-uv --version
-light --version
-python --version  # Should be 3.12+
-```
-
-### Step 3: Local Testing
-
-Test your setup locally before deploying:
-
-```bash
-# Run authentication tests
-uv run python tests/test_authentication.py
-
-# Start coordinator agent
-uv run python run_coordinator.py
-```
-
-**Expected Output:**
+**Look for this output:**
 ```
 ============================================================
-PrivAgent Coordinator - Starting...
-============================================================
-
-Agent Address: agent1qf...
-Port: 8000
-
-To test via ASI:One:
-1. Go to https://asi1.ai
-2. Search for agent: agent1qf...
-3. Send message: 'hello' or 'help'
+🤖 COORDINATOR AGENT ADDRESS: agent1qf8xk3j2...
+📍 Search for this address on https://asi1.ai
 ============================================================
 ```
 
-### Step 4: Deploy to Agentverse
+### 3. Test on ASI:One
 
-**⚠️ Important Limitation:** Agentverse does not support the Light Protocol CLI (requires npm installation). When deploying to Agentverse, ZK compression features will use simulated mode. For full Light Protocol functionality, run agents locally.
-
-To deploy to production on Agentverse, you need to deploy all 4 agents:
-
-#### 4.1 Deploy Privacy Agent
-
-1. Go to [agentverse.ai](https://agentverse.ai/) and log in
-2. Click "My Agents" → "New Agent" → "Blank Agent"
-3. Name: `PrivAgent Privacy`
-4. Copy content from `agents/privacy_agent.py` and paste
-5. Add environment variables in "Secrets" tab:
-   ```bash
-   BLOCKCHAIN_HELIUS_RPC_URL=your-helius-rpc-url
-   PRIVACY_AGENT_SEED=your-secure-seed
-   CLI_FALLBACK_TO_API=true  # Required for Agentverse (no CLI available)
-   ```
-6. Click "Start" and copy the agent address (starts with `agent1...`)
-
-#### 4.2 Deploy Execution Agent
-
-1. Create new agent: `PrivAgent Execution`
-2. Copy content from `agents/execution_agent.py`
-3. Add environment variables including `PAYER_KEYPAIR_PATH`
-4. Start and copy agent address
-
-#### 4.3 Deploy Monitoring Agent
-
-1. Create new agent: `PrivAgent Monitoring`
-2. Copy content from `agents/monitoring_agent.py`
-3. Add environment variables
-4. Start and copy agent address
-
-#### 4.4 Deploy Coordinator Agent
-
-1. Create new agent: `PrivAgent Coordinator`
-2. Copy content from `agents/coordinator.py`
-3. Add environment variables including addresses from previous steps:
-   ```bash
-   PRIVACY_AGENT_ADDRESS=agent1q... (from step 4.1)
-   EXECUTION_AGENT_ADDRESS=agent1q... (from step 4.2)
-   MONITORING_AGENT_ADDRESS=agent1q... (from step 4.3)
-   ```
-4. Start and copy the coordinator agent address (main entry point)
-
-### Step 5: Test on ASI:One
-
-1. Visit [asi1.ai](https://asi1.ai/) or [agentverse.ai/chat](https://agentverse.ai/chat)
-2. Search for your coordinator agent address or "PrivAgent Coordinator"
-3. Test with commands:
+1. **Copy** the coordinator address (starts with `agent1...`)
+2. Go to **https://asi1.ai**
+3. Search for your coordinator address
+4. Type commands:
    ```
    "hello"
    "help"
    "check privacy score for wallet Gx7UJ7XNBFxRDehVQhZtKRhYHA1J1pkmvxAMUeF4CX"
    ```
-4. Verify:
-   - Agent responds to messages
-   - Responses are formatted correctly
-   - Session persists across messages
 
-### Recommended: Local Multi-Agent Deployment
+✅ **That's it!** Your agents are discoverable and ready for the hackathon.
 
-**For full Light Protocol CLI support**, run all agents locally on your machine:
+---
+
+## 🤖 Agent Addresses
+
+**Production Deployment (Local with Mailbox):**
+- **Coordinator Agent**: *(Copy from startup output)*
+- **Privacy Agent**: *(Generated from PRIVACY_AGENT_SEED)*
+- **Execution Agent**: *(Generated from EXECUTION_AGENT_SEED)*
+- **Monitoring Agent**: *(Generated from MONITORING_AGENT_SEED)*
+
+**Test via ASI:One**: Search for the coordinator address at https://asi1.ai
+
+### Demo Commands
+
+Try these commands in ASI:One to showcase all features:
+- `"hello"` – Basic connectivity test
+- `"help"` – Shows all available commands
+- `"check privacy score for wallet Gx7UJ7XNBFxRDehVQhZtKRhYHA1J1pkmvxAMUeF4CX"` – Privacy analysis with MeTTa Knowledge Graph
+- `"compress 100 USDC from my wallet"` – ZK compression (if Light CLI installed)
+- `"monitor my wallet for privacy issues"` – Real-time privacy monitoring
+
+---
+
+## 🚀 Full Setup (Optional)
+
+For complete development setup with Light Protocol CLI support:
+
+### Prerequisites
+
+- Python 3.12+ and uv
+- Light Protocol CLI (optional for ZK compression)
+- Helius API key
+- OpenAI or ASI:One API key
+
+### Complete Installation
 
 ```bash
-# Terminal 1: Privacy Agent
-uv run python agents/privacy_agent.py
+# Install dependencies
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv sync
 
-# Terminal 2: Execution Agent
-uv run python agents/execution_agent.py
-
-# Terminal 3: Monitoring Agent
-uv run python agents/monitoring_agent.py
-
-# Terminal 4: Coordinator
-uv run python run_coordinator.py
+# Optional: Install Light Protocol CLI for real ZK compression
+npm install -g @lightprotocol/zk-compression-cli
 ```
 
-All agents will run locally with full ZK compression capabilities via Light Protocol CLI.
+### Testing
+
+```bash
+# Start agents (no wallet configuration needed)
+./run_all_agents.sh
+```
 
 ### Troubleshooting
 
 **Agent Won't Start:**
 ```bash
 # Check Python version
-python --version  # Must be 3.12+
+python --version  # Should be 3.12+
 
 # Reinstall dependencies
 uv sync
 
-# Check .env file exists and is configured
+# Check .env configuration
 cat .env | grep -v "^#" | grep -v "^$"
 ```
 
 **ASI:One Can't Find Agent:**
-1. Verify agent is "Active" on [agentverse.ai/agents](https://agentverse.ai/agents)
-2. Check "Chat Protocol" badge is visible
-3. Verify `publish_manifest=True` in coordinator.py
-4. Wait 5-10 minutes for discovery propagation
+1. Verify `mailbox=True` in agent configuration
+2. Check `publish_manifest=True` in coordinator.py
+3. Wait 5-10 minutes for Agentverse discovery
+4. Ensure no `endpoint` configuration overrides mailbox
 
 ---
 
@@ -289,7 +143,8 @@ cat .env | grep -v "^#" | grep -v "^$"
 | --- | --- | --- |
 | Blockchain | `BLOCKCHAIN_HELIUS_RPC_URL`, `BLOCKCHAIN_SOLANA_RPC_URL`, `BLOCKCHAIN_SOLANA_NETWORK` | Provide mainnet + backup RPCs. |
 | Agents | `COORDINATOR_SEED`, `PRIVACY_AGENT_SEED`, `EXECUTION_AGENT_SEED`, `MONITORING_AGENT_SEED` | Use distinct secure seed phrases. |
-| Wallet | `PAYER_PRIVATE_KEY` or `PAYER_KEYPAIR_PATH` | JSON array (SPL keypair) or path to keypair file. |
+| Security | **Client-side signing (recommended)** | Transactions returned unsigned for wallet signing. Zero custody risk. |
+| Wallet | `PAYER_PRIVATE_KEY` or `PAYER_KEYPAIR_PATH` *(disabled by default)* | **Not recommended for production.** Enable only for testing. |
 | Execution | `EXECUTION_JUPITER_API_KEY`, `EXECUTION_MAX_PRIORITY_FEE`, `JUPITER_TIMING_JITTER` | Tunes Jupiter client privacy + performance. |
 | CLI | `LIGHT_CLI_PATH`, `CLI_LIGHT_CLI_PATH`, `CLI_TIMEOUT_SECONDS` | Controls Light Protocol CLI discovery & safety. |
 | Monitoring | `MONITORING_DEFAULT_PRIVACY_THRESHOLD`, `MONITORING_ALERT_COOLDOWN_MINUTES` | Alert thresholds and cooldown. |
@@ -411,6 +266,77 @@ Publish agent addresses (`*_AGENT_ADDRESS`) when you want preconfigured routing 
 - **MEV Protection Mechanisms** - Defense against sandwich attacks
 - **Zero-Knowledge Compression** - Advanced privacy techniques
 - **Risk Assessment Tools** - Proactive threat detection
+
+---
+
+## 🔒 Security Model
+
+### Client-Side Signing Architecture
+
+**PrivAgent uses a zero-custody security model** - your private keys never touch our backend servers.
+
+#### How It Works
+
+1. **Agent Creates Transaction**
+   - Analyzes your request (transfer, swap, compression)
+   - Builds optimal transaction parameters
+   - Returns unsigned transaction data
+
+2. **You Sign in Your Wallet**
+   - Transaction displayed in Phantom/Solflare
+   - You review and approve
+   - Your wallet signs with your private key
+
+3. **Transaction Executes On-Chain**
+   - Signed transaction broadcasts to Solana
+   - Settlement happens on-chain
+   - Agent never has custody
+
+#### Security Guarantees
+
+✅ **No Custody Risk** - Backend never holds your private keys
+✅ **Cryptographic Proof** - Wallet signature proves ownership
+✅ **Web3-Native** - Same security model as Uniswap, Jupiter, Raydium
+✅ **User Control** - You approve every transaction explicitly
+✅ **No Backend Auth** - Wallet signing eliminates need for separate authentication
+
+#### Why This Is Better
+
+Traditional custodial models require:
+- Backend to hold private keys (custody risk)
+- Complex authentication flows (challenge-response)
+- Trust in the service provider
+
+Client-side signing eliminates all of these:
+- **Zero trust required** - You hold your keys
+- **Simple UX** - One-click wallet approval
+- **Battle-tested** - Industry-standard approach
+
+#### Technical Implementation
+
+**Agent-to-Agent Communication:**
+- Uses uAgents built-in cryptographic message verification
+- All inter-agent messages are automatically signed and verified by uAgents framework
+- Follows Fetch.ai security standards for distributed agent systems
+
+**Transaction Flow:**
+```python
+# Agent returns unsigned transaction
+{
+    "success": true,
+    "requires_signing": true,
+    "operation": "transfer",
+    "unsigned_transaction": "base64_encoded_tx...",
+    "instructions": [...]
+}
+
+# User signs in wallet → broadcasts to Solana
+```
+
+**For Developers:**
+- Client-side signing implementation in `agents/execution_agent.py`
+- See `_finalize_swap()` and `_standard_transfer()` for unsigned transaction return logic
+- Frontend wallet integration guide available in project documentation
 
 ---
 

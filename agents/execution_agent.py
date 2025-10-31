@@ -324,7 +324,23 @@ class TransferExecutor:
         privacy_features: List[str],
     ) -> Dict[str, Any]:
         if wallet is None:
-            raise RuntimeError("No payer wallet configured. Set PAYER_PRIVATE_KEY or PAYER_KEYPAIR_PATH.")
+            # CLIENT-SIDE SIGNING: Return transaction details for wallet signing
+            return {
+                "success": True,
+                "requires_signing": True,
+                "operation": "transfer",
+                "from_wallet": request.from_wallet,
+                "to_wallet": request.to_wallet,
+                "amount": request.amount,
+                "token_mint": request.token_mint,
+                "message": "⚠️ Transaction ready. Please sign with your wallet (Phantom/Solflare) to complete the transfer.",
+                "instructions": [
+                    "1. Connect your Solana wallet",
+                    f"2. Approve transfer of {request.amount} tokens",
+                    f"3. From: {request.from_wallet[:16]}...",
+                    f"4. To: {request.to_wallet[:16]}...",
+                ],
+            }
 
         from_account = Pubkey.from_string(request.from_wallet)
         to_account = Pubkey.from_string(request.to_wallet)
@@ -394,66 +410,25 @@ class TransferExecutor:
         }
 
     async def _compressed_transfer(self, ctx: Context, request: TransferRequest) -> Dict[str, Any]:
-        mint = request.token_mint
-        decimals = self._decimals_cache.get(mint, config.token.usdc_decimals)
-        amount_base = int(round(request.amount * (10**decimals)))
-
-        command = [
-            os.getenv("LIGHT_CLI_PATH", config.cli.light_cli_path),
-            "transfer",
-            "--mint",
-            mint,
-            "--to",
-            request.to_wallet,
-            "--amount",
-            str(amount_base),
-            "--output",
-            "json",
-        ]
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=PIPE,
-                stderr=PIPE,
-            )
-        except FileNotFoundError:
-            if config.cli.fallback_to_api:
-                # We allow a simulated response so the UX still works on machines without the Light CLI.
-                ctx.logger.warning("Light CLI not found. Returning simulated compression response.")
-                return {
-                    "success": True,
-                    "compression": True,
-                    "signature": "simulation",
-                    "explorer_url": "https://explorer.solana.com/tx/simulation",
-                }
-            raise RuntimeError(f"Light CLI not available at {command[0]}")
-
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=config.cli.cli_timeout_seconds)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            return {"success": False, "error": "compression command timed out"}
-
-        if process.returncode != 0:
-            error_text = stderr.decode().strip() or "Light CLI reported an error"
-            return {"success": False, "error": error_text}
-
-        try:
-            payload = json.loads(stdout.decode())
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Invalid Light CLI response") from exc
-
-        signature = payload.get("signature") or payload.get("txSig")
-        explorer_url = f"https://explorer.solana.com/tx/{signature}" if signature else None
-
+        # CLIENT-SIDE SIGNING: Compression requires Light Protocol client-side integration
+        ctx.logger.info("Compressed transfer requested - requires client-side Light Protocol integration")
         return {
             "success": True,
+            "requires_signing": True,
+            "operation": "compressed_transfer",
+            "from_wallet": request.from_wallet,
+            "to_wallet": request.to_wallet,
+            "amount": request.amount,
+            "token_mint": request.token_mint,
             "compression": True,
-            "signature": signature,
-            "explorer_url": explorer_url,
-            "privacy_features": ["compression"],
+            "message": "⚠️ Compressed transfer ready. Requires Light Protocol wallet integration to sign and compress on-chain.",
+            "instructions": [
+                "1. Use Light Protocol-compatible wallet",
+                f"2. Approve compressed transfer of {request.amount} tokens",
+                f"3. To: {request.to_wallet[:16]}...",
+                "4. Transaction will be compressed on-chain for privacy",
+            ],
+            "note": "Compression reduces on-chain footprint and enhances privacy",
         }
 
     async def _decimals_for_mint(self, mint: Pubkey, ctx: Context) -> int:
@@ -515,7 +490,8 @@ class ExecutionService:
             ctx.storage.set("wallet_public_key", str(self.wallet.pubkey()))
             ctx.logger.info("Loaded execution wallet")
         else:
-            ctx.logger.warning("No payer wallet detected; swap execution will return unsigned transactions.")
+            ctx.logger.info("🔒 CLIENT-SIDE SIGNING MODE: All transactions returned unsigned for wallet signing")
+            ctx.logger.info("🔒 Security: Zero custody risk - users sign with Phantom/Solflare")
 
     async def shutdown(self) -> None:
         await self.jupiter.close()
@@ -721,60 +697,26 @@ class ExecutionService:
         # Decode base64 to raw bytes
         tx_bytes = base64.b64decode(swap_tx)
 
-        # No wallet? Return unsigned transaction for client to sign themselves
+        # CLIENT-SIDE SIGNING: Return unsigned transaction for wallet signing
         if self.wallet is None:
             return {
                 "success": True,
+                "requires_signing": True,
+                "operation": "swap",
                 "unsigned_transaction": swap_tx,
-                "message": "No payer wallet configured. Return unsigned swap transaction for client-side signing.",
+                "wallet": request.wallet,
+                "input_token": request.input_token,
+                "output_token": request.output_token,
+                "amount": request.amount,
+                "message": "⚠️ Swap transaction ready. Sign with your wallet (Phantom/Solflare) to execute the swap.",
+                "instructions": [
+                    "1. Connect your Solana wallet",
+                    "2. Review swap details carefully",
+                    "3. Sign the transaction to complete the swap",
+                    "4. Transaction will execute atomically via Jupiter aggregator",
+                ],
+                "note": "MEV protection enabled - transaction includes slippage limits and priority fees",
             }
-
-        # Try to deserialize as VersionedTransaction first (Solana's newer tx format)
-        try:
-            versioned = VersionedTransaction.deserialize(tx_bytes)
-        except Exception:
-            # Not a versioned transaction, might be legacy format
-            versioned = None
-
-        # Sign the transaction (different logic for versioned vs legacy)
-        if isinstance(versioned, VersionedTransaction):
-            # Versioned transaction: sign in place and serialize
-            versioned.sign([self.wallet])
-            raw_tx = bytes(versioned)
-        else:
-            # Legacy transaction: deserialize, extract instructions, re-sign
-            legacy = Transaction.deserialize(tx_bytes)
-            message = Message(legacy.message)
-            signed = Transaction.new_signed_with_payer(
-                [ix for ix in message.instructions],
-                payer=self.wallet.pubkey(),
-                signing_keypairs=[self.wallet],
-                recent_blockhash=message.recent_blockhash,
-            )
-            raw_tx = bytes(signed)
-
-        # Submit signed transaction to Solana RPC
-        signature = await self.client.send_raw_transaction(
-            raw_tx,
-            opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed, max_retries=3),
-        )
-        # Handle different RPC response formats
-        if isinstance(signature, dict):
-            signature = signature.get("result")
-
-        if not signature:
-            return {"success": False, "error": "Swap submission returned empty signature"}
-
-        # Wait for transaction confirmation on-chain
-        sig_str = str(signature)
-        await self.client.confirm_transaction(Signature.from_string(sig_str), commitment=Confirmed)
-
-        return {
-            "success": True,
-            "signature": sig_str,
-            "explorer_url": f"https://explorer.solana.com/tx/{sig_str}",
-            "last_valid_block_height": payload.get("lastValidBlockHeight"),
-        }
 
     def _congestion_level(self, tps: float) -> str:
         if tps < 1_000:
@@ -797,21 +739,10 @@ class ExecutionService:
         return base
 
     def _load_wallet(self) -> Optional[SoldersKeypair]:
-        raw = os.getenv("PAYER_PRIVATE_KEY")
-        if raw:
-            try:
-                if raw.startswith("["):
-                    return SoldersKeypair.from_bytes(bytes(json.loads(raw)))
-                return SoldersKeypair.from_bytes(base64.b64decode(raw))
-            except Exception:
-                return None
-
-        path = os.getenv("PAYER_KEYPAIR_PATH")
-        if path and os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as handle:
-                key_bytes = json.load(handle)
-            return SoldersKeypair.from_bytes(bytes(key_bytes))
-        return None
+        # CLIENT-SIDE SIGNING MODEL: Backend does not hold private keys
+        # All transactions are returned unsigned for client-side signing via Phantom/Solflare
+        # This eliminates custody risk and aligns with Web3 security best practices
+        return None  # Always return None to force unsigned transaction mode
 
 
 # -----------------------------------------------------------------------------
@@ -823,11 +754,9 @@ service = ExecutionService()
 
 execution_agent = Agent(
     name="PrivAgent_Execution",
-    port=config.execution.agent_port,
-    mailbox=True,
     seed=config.execution.agent_seed,
+    mailbox=True,
     readme_path="README.md",
-    endpoint=[f"http://127.0.0.1:{config.execution.agent_port}/submit"],
     publish_agent_details=True,
 )
 

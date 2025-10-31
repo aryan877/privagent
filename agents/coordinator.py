@@ -28,8 +28,6 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 from agents.config import config
-# Import authentication module for agent-to-agent verification
-from agents.auth import auth_manager, create_message_digest
 from models.messages import (
     ExecutionResponse,
     MonitoringRequest,
@@ -88,7 +86,7 @@ class CoordinatorService:
     - Maintains session state for multi-turn conversations
     - Supports both static (env vars) and dynamic (almanac) agent discovery
 
-    Security: Agent-to-agent messages cryptographically verified (see agents/auth.py)
+    Security: Agent-to-agent messages cryptographically verified by uAgents framework
 
     Example Flow:
     User: "I want to privately swap 50 USDC to SOL"
@@ -168,7 +166,7 @@ class CoordinatorService:
                 await self._send_text(ctx, sender, "Session closed. Reach out anytime.")
 
     async def receive_privacy_response(self, ctx: Context, sender: str, msg: PrivacyResponse) -> None:
-        # Verify message from privacy agent (agent-to-agent auth)
+        # Verify message is from expected privacy agent
         if self.privacy_agent and sender != self.privacy_agent:
             ctx.logger.warning(f"Privacy response from unauthorized agent: {sender}")
             return
@@ -183,7 +181,7 @@ class CoordinatorService:
         self._remove_pending(ctx, msg.request_id)
 
     async def receive_execution_response(self, ctx: Context, sender: str, msg: ExecutionResponse) -> None:
-        # Verify message from execution agent
+        # Verify message is from expected execution agent
         if self.execution_agent and sender != self.execution_agent:
             ctx.logger.warning(f"Execution response from unauthorized agent: {sender}")
             return
@@ -198,7 +196,7 @@ class CoordinatorService:
         self._remove_pending(ctx, msg.request_id)
 
     async def receive_monitoring_response(self, ctx: Context, sender: str, msg: MonitoringResponse) -> None:
-        # Verify message from monitoring agent
+        # Verify message is from expected monitoring agent
         if self.monitoring_agent and sender != self.monitoring_agent:
             ctx.logger.warning(f"Monitoring response from unauthorized agent: {sender}")
             return
@@ -213,7 +211,7 @@ class CoordinatorService:
         self._remove_pending(ctx, msg.request_id)
 
     async def receive_privacy_alert(self, ctx: Context, sender: str, msg: PrivacyAlert) -> None:
-        # Verify alert from monitoring/privacy agents
+        # Verify alert is from expected monitoring/privacy agents
         if self.monitoring_agent and sender not in [self.monitoring_agent, self.privacy_agent]:
             ctx.logger.warning(f"Privacy alert from unauthorized agent: {sender}")
             return
@@ -843,6 +841,44 @@ class CoordinatorService:
         if not msg.success:
             return f"Transaction failed: {msg.result.get('error', 'unknown error')}."
 
+        # CLIENT-SIDE SIGNING: Check if transaction requires wallet signing
+        if msg.result.get("requires_signing"):
+            operation = msg.result.get("operation", "transaction")
+            message = msg.result.get("message", "Transaction ready for signing")
+            instructions = msg.result.get("instructions", [])
+
+            lines = [
+                f"🔒 {message}",
+                "",
+                "Instructions:",
+            ]
+            lines.extend(f"   {instr}" for instr in instructions)
+
+            # Add operation-specific details
+            if operation == "transfer":
+                lines.extend([
+                    "",
+                    "Transfer Details:",
+                    f"   • Amount: {msg.result.get('amount')} tokens",
+                    f"   • From: {msg.result.get('from_wallet', 'N/A')[:16]}...",
+                    f"   • To: {msg.result.get('to_wallet', 'N/A')[:16]}...",
+                ])
+            elif operation == "swap":
+                lines.extend([
+                    "",
+                    "Swap Details:",
+                    f"   • Amount: {msg.result.get('amount')}",
+                    f"   • From: {msg.result.get('input_token', 'N/A')[:16]}...",
+                    f"   • To: {msg.result.get('output_token', 'N/A')[:16]}...",
+                    f"   • Wallet: {msg.result.get('wallet', 'N/A')[:16]}...",
+                ])
+
+            if msg.result.get("note"):
+                lines.extend(["", f"ℹ️ {msg.result['note']}"])
+
+            return "\n".join(lines)
+
+        # Legacy backend-signed transaction response
         signature = msg.signature or msg.result.get("signature", "pending")
         details = msg.result.get("details", {})
         lines = [
@@ -901,11 +937,9 @@ service = CoordinatorService()
 
 coordinator = Agent(
     name="coordinator",
-    port=int(os.getenv("AGENT_PORT_COORDINATOR", 8000)),
-    mailbox=True,
     seed=os.getenv("COORDINATOR_SEED", "coordinator_seed_default"),
+    mailbox=True,
     readme_path="README.md",
-    endpoint=[f"http://127.0.0.1:{os.getenv('AGENT_PORT_COORDINATOR', 8000)}/submit"],
     publish_agent_details=True,
 )
 
@@ -914,6 +948,10 @@ protocol = Protocol(spec=chat_protocol_spec)
 
 @coordinator.on_event("startup")
 async def on_startup(ctx: Context) -> None:
+    ctx.logger.info("=" * 60)
+    ctx.logger.info("🤖 COORDINATOR AGENT ADDRESS: %s", ctx.agent.address)
+    ctx.logger.info("📍 Search for this address on https://asi1.ai")
+    ctx.logger.info("=" * 60)
     await service.startup(ctx)
 
 

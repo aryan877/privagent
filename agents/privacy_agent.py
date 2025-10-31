@@ -845,11 +845,9 @@ service = PrivacyService()
 
 privacy_agent = Agent(
     name="privacy",
-    port=config.privacy.agent_port,
-    mailbox=True,
     seed=config.privacy.agent_seed,
+    mailbox=True,
     readme_path="README.md",
-    endpoint=[f"http://127.0.0.1:{config.privacy.agent_port}/submit"],
     publish_agent_details=True,
 )
 
