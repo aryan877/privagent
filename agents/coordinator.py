@@ -938,20 +938,23 @@ service = CoordinatorService()
 coordinator = Agent(
     name="coordinator",
     seed=os.getenv("COORDINATOR_SEED", "coordinator_seed_default"),
+    port=int(os.getenv("AGENT_PORT_COORDINATOR", "8000")),
     mailbox=True,
     readme_path="README.md",
     publish_agent_details=True,
 )
+
+# Print address immediately when agent is created
+print("=" * 60)
+print("🤖 COORDINATOR AGENT ADDRESS:", coordinator.address)
+print("📍 Search for this address on https://asi1.ai")
+print("=" * 60)
 
 protocol = Protocol(spec=chat_protocol_spec)
 
 
 @coordinator.on_event("startup")
 async def on_startup(ctx: Context) -> None:
-    ctx.logger.info("=" * 60)
-    ctx.logger.info("🤖 COORDINATOR AGENT ADDRESS: %s", ctx.agent.address)
-    ctx.logger.info("📍 Search for this address on https://asi1.ai")
-    ctx.logger.info("=" * 60)
     await service.startup(ctx)
 
 
@@ -963,6 +966,14 @@ async def on_chat_message(ctx: Context, sender: str, message: ChatMessage) -> No
 @protocol.on_message(ChatAcknowledgement)
 async def on_chat_ack(ctx: Context, sender: str, message: ChatAcknowledgement) -> None:
     ctx.logger.debug("message %s acknowledged by %s", message.acknowledged_msg_id, sender)
+
+
+# Include the chat protocol to enable ASI:One compatibility
+coordinator.include(protocol, publish_manifest=True)
+
+
+if __name__ == "__main__":
+    coordinator.run()
 
 
 @coordinator.on_message(PrivacyResponse)

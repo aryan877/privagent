@@ -651,10 +651,17 @@ service = MonitoringService()
 monitoring_agent = Agent(
     name="PrivAgent_Monitoring",
     seed=config.monitoring.agent_seed,
+    port=config.monitoring.agent_port,
     mailbox=True,
     readme_path="README.md",
     publish_agent_details=True,
 )
+
+# Print address immediately when agent is created
+print("=" * 60)
+print("📡 MONITORING AGENT ADDRESS:", monitoring_agent.address)
+print("📍 Search for this address on https://asi1.ai")
+print("=" * 60)
 
 
 @monitoring_agent.on_event("startup")
@@ -750,3 +757,7 @@ def _looks_like_swap(instruction: str) -> bool:
         return False
     keywords = ("swap", "dex", "amm", "raydium", "orca", "jupiter")
     return any(keyword in instruction.lower() for keyword in keywords)
+
+
+if __name__ == "__main__":
+    monitoring_agent.run()

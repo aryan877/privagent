@@ -846,10 +846,17 @@ service = PrivacyService()
 privacy_agent = Agent(
     name="privacy",
     seed=config.privacy.agent_seed,
+    port=config.privacy.agent_port,
     mailbox=True,
     readme_path="README.md",
     publish_agent_details=True,
 )
+
+# Print address immediately when agent is created
+print("=" * 60)
+print("🔒 PRIVACY AGENT ADDRESS:", privacy_agent.address)
+print("📍 Search for this address on https://asi1.ai")
+print("=" * 60)
 
 
 @privacy_agent.on_event("startup")
@@ -878,3 +885,7 @@ async def on_advanced_analysis_request(ctx: Context, sender: str, msg: AdvancedP
 async def on_zk_privacy_request(ctx: Context, sender: str, msg: ZKPrivacyRequest) -> None:
     response = await service.handle_zk_privacy_request(ctx, msg)
     await ctx.send(sender, response)
+
+
+if __name__ == "__main__":
+    privacy_agent.run()

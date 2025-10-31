@@ -755,10 +755,17 @@ service = ExecutionService()
 execution_agent = Agent(
     name="PrivAgent_Execution",
     seed=config.execution.agent_seed,
+    port=config.execution.agent_port,
     mailbox=True,
     readme_path="README.md",
     publish_agent_details=True,
 )
+
+# Print address immediately when agent is created
+print("=" * 60)
+print("⚡ EXECUTION AGENT ADDRESS:", execution_agent.address)
+print("📍 Search for this address on https://asi1.ai")
+print("=" * 60)
 
 
 @execution_agent.on_event("startup")
@@ -798,12 +805,6 @@ async def emit_metrics(ctx: Context) -> None:
 # -----------------------------------------------------------------------------
 
 
-def load_payer_keypair(refresh: bool = False) -> Optional[SoldersKeypair]:
-    if refresh:
-        service.wallet = service._load_wallet()
-    return service.wallet
-
-
 async def get_jupiter_quote(ctx: Context, request: SwapRequest) -> Dict[str, Any]:
     slippage = request.slippage_bps or config.execution.default_slippage_bps
     return await service.jupiter.quote(request, slippage, service.session_limiter)
@@ -816,3 +817,7 @@ async def regular_transfer_with_privacy_features(
 ) -> Dict[str, Any]:
     _ = tx_context  # maintained for backward compatibility with legacy tests
     return await service.transfer_executor.execute(ctx, request, service.wallet)
+
+
+if __name__ == "__main__":
+    execution_agent.run()
